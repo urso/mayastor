@@ -187,11 +187,18 @@ impl IPoolProps for Lvs {
 
     fn disks(&self) -> Vec<String> {
         // Calling crypto_base_bdev() on non crypto bdev returns None.
-        let disk_bdev = self
-            .base_bdev()
+        let root_base_bdev = self.base_bdev();
+        let disk_bdev = root_base_bdev
             .crypto_base_bdev()
             .map(Bdev::new)
-            .unwrap_or_else(|| self.base_bdev());
+            .unwrap_or(root_base_bdev);
+
+        if let Some(raid_bdev) = disk_bdev.as_raid_bdev() {
+            return raid_bdev
+                .iter_member_bdevs()
+                .map(|bdev| bdev.bdev_uri_str().unwrap_or_else(|| "".into()))
+                .collect();
+        }
 
         vec![disk_bdev.bdev_uri_str().unwrap_or_else(|| "".into())]
     }

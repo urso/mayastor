@@ -248,6 +248,24 @@ impl CreateDestroy for Raid {
 }
 
 impl Raid {
+    pub fn new(
+        name: String,
+        alias: String,
+        disks: Vec<String>,
+        level: &'static RaidLevel,
+        uuid: uuid::Uuid,
+        strip_size_kb: u32,
+    ) -> Self {
+        Self {
+            name,
+            alias,
+            disks,
+            level,
+            uuid,
+            strip_size_kb,
+        }
+    }
+
     /// Create the RAID bdev using SPDK API - now generic across all RAID levels
     async fn create_raid_bdev(&self, device_names: &[String]) -> Result<String, BdevError> {
         let mut raid_bdev = RaidBdev::create(

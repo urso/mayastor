@@ -7,14 +7,17 @@ use futures::channel::oneshot;
 use nix::errno::Errno;
 use pin_utils::core_reexport::fmt::Formatter;
 
-use spdk_rs::libspdk::{
-    bdev_aio_rescan, spdk_bdev_update_bs_blockcnt, spdk_blob_store, spdk_bs_free_cluster_count,
-    spdk_bs_get_cluster_size, spdk_bs_get_md_len, spdk_bs_get_page_size, spdk_bs_get_used_md,
-    spdk_bs_total_data_cluster_count, spdk_lvol, spdk_lvol_opts, spdk_lvol_opts_init,
-    spdk_lvol_store, spdk_lvs_grow_live, vbdev_get_lvol_store_by_name,
-    vbdev_get_lvol_store_by_uuid, vbdev_get_lvs_bdev_by_lvs, vbdev_lvol_create_with_opts,
-    vbdev_lvs_create, vbdev_lvs_create_with_uuid, vbdev_lvs_destruct, vbdev_lvs_import,
-    vbdev_lvs_unload, LVOL_CLEAR_WITH_NONE, LVOL_CLEAR_WITH_UNMAP, LVS_CLEAR_WITH_NONE,
+use spdk_rs::{
+    libspdk,
+    libspdk::{
+        bdev_aio_rescan, spdk_bdev_update_bs_blockcnt, spdk_blob_store, spdk_bs_free_cluster_count,
+        spdk_bs_get_cluster_size, spdk_bs_get_md_len, spdk_bs_get_page_size, spdk_bs_get_used_md,
+        spdk_bs_total_data_cluster_count, spdk_lvol, spdk_lvol_opts, spdk_lvol_opts_init,
+        spdk_lvol_store, spdk_lvs_grow_live, vbdev_get_lvol_store_by_name,
+        vbdev_get_lvol_store_by_uuid, vbdev_get_lvs_bdev_by_lvs, vbdev_lvol_create_with_opts,
+        vbdev_lvs_create, vbdev_lvs_create_with_uuid, vbdev_lvs_destruct, vbdev_lvs_import,
+        vbdev_lvs_unload, LVOL_CLEAR_WITH_NONE, LVOL_CLEAR_WITH_UNMAP, LVS_CLEAR_WITH_NONE,
+    },
 };
 use url::Url;
 
@@ -23,12 +26,14 @@ use super::{BsError, ImportErrorReason, Lvol, LvsError, LvsIter, PropName, PropV
 use crate::{
     bdev::{
         crypto::{create_crypto_vbdev_on_base_bdev, destroy_crypto_vbdev},
-        uri, PtplFileOps,
+        dev::device_create,
+        raid::{Raid, RaidLevel, RAID0},
+        uri, BdevCreateDestroy, CreateDestroy, GetName, PtplFileOps,
     },
     bdev_api::{bdev_destroy, BdevError},
     core::{
-        logical_volume::LogicalVolume, snapshot::LvolSnapshotOps, Bdev, IoType, NvmfShareProps,
-        Share, UntypedBdev,
+        logical_volume::LogicalVolume, raid::RaidBdev, snapshot::LvolSnapshotOps, Bdev, IoType,
+        NvmfShareProps, Share, UntypedBdev,
     },
     eventing::Event,
     ffihelper::{cb_arg, pair, AsStr, ErrnoResult, FfiResult, IntoCString},
@@ -36,12 +41,89 @@ use crate::{
         lvs_lvol::{LvsLvol, WIPE_SUPER_LEN},
         LvolSnapshotDescriptor,
     },
-    pool_backend::{PoolArgs, ReplicaArgs},
+    pool_backend::{PoolArgs, RaidConfig, ReplicaArgs},
 };
 
 static ROUND_TO_MB: u32 = 1024 * 1024;
 /// Default spdk cluster size is 4MiB.
 static DEFAULT_CLUSTER_SIZE: u32 = 4 * 1024 * 1024;
+
+/// Builder for RAID creation that handles child device creation before RAID setup
+#[derive(Debug)]
+pub struct LvsRaidBuilder {
+    name: String,
+    alias: String,
+    child_uris: Vec<String>,
+    level: &'static RaidLevel,
+    uuid: uuid::Uuid,
+    strip_size_kb: u32,
+}
+
+impl GetName for LvsRaidBuilder {
+    fn get_name(&self) -> String {
+        self.name.clone()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl CreateDestroy for LvsRaidBuilder {
+    type Error = BdevError;
+
+    async fn create(&self) -> Result<String, Self::Error> {
+        // Create child devices first
+        let mut child_names = Vec::new();
+        for child_uri in &self.child_uris {
+            match device_create(child_uri).await {
+                Ok(device_name) => {
+                    child_names.push(device_name);
+                }
+                Err(e) => {
+                    // Clean up already created children on failure
+                    for created_child in &self.child_uris[..child_names.len()] {
+                        if let Err(cleanup_err) =
+                            crate::bdev::dev::device_destroy(created_child).await
+                        {
+                            warn!(
+                                "Failed to cleanup child device '{}': {}",
+                                created_child, cleanup_err
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+            }
+        }
+
+        let raid = Raid::new(
+            self.name.clone(),
+            self.alias.clone(),
+            child_names,
+            self.level,
+            self.uuid,
+            self.strip_size_kb,
+        );
+        raid.create().await
+    }
+
+    async fn destroy(self: Box<Self>) -> Result<(), Self::Error> {
+        let Some(raid_bdev) = RaidBdev::find_by_name(&self.name) else {
+            return Err(BdevError::BdevNotFound {
+                name: self.name.clone(),
+            });
+        };
+        raid_bdev.delete().await?;
+
+        // Destroy child devices that we created
+        for child_uri in &self.child_uris {
+            if let Err(e) = crate::bdev::dev::device_destroy(child_uri).await {
+                warn!("Failed to destroy child device '{}': {}", child_uri, e);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// Maximum spdk cluster size can be considered as 1GiB.
 static MAX_CLUSTER_SIZE: u32 = 1024 * 1024 * 1024;
 
@@ -185,11 +267,33 @@ impl Lvs {
     /// Is the Lvs/pool encrypted.
     pub fn encrypted(&self) -> bool {
         let b = self.base_bdev();
+
+        // Checking for the crypto driver is ok here even when Raid support is enabled.
+        // The crypto bdev is created created on the Raid bdev.
         b.driver() == "crypto"
     }
 
+    pub(crate) fn raid_bdev(&self) -> Option<RaidBdev> {
+        let base = self.base_bdev();
+        let bdev = base.crypto_base_bdev().map(Bdev::new).unwrap_or(base);
+        bdev.as_raid_bdev()
+    }
+
+    /// Get RAID information for the pool, if it uses RAID storage.
+    /// Returns None if the pool does not use RAID.
     pub fn raid_info(&self) -> Option<crate::pool_backend::RaidInfo> {
-        None
+        self.raid_bdev()
+            .map(|raid_bdev| crate::pool_backend::RaidInfo {
+                // Currently only RAID0 is supported
+                level: match raid_bdev.level() {
+                    libspdk::RAID0 => "raid0".to_string(),
+                    libspdk::RAID1 => "raid1".to_string(),
+                    libspdk::RAID5F => "raid5f".to_string(),
+                    libspdk::CONCAT => "concat".to_string(),
+                    _ => "unknown".to_string(),
+                },
+                state: raid_bdev.state().to_string(),
+            })
     }
 
     /// Returns blobstore cluster size.
@@ -225,24 +329,69 @@ impl Lvs {
         uuid::Uuid::from_bytes(t).to_string()
     }
 
+    pub fn parse_pool_args(
+        args: &PoolArgs,
+    ) -> Result<Box<dyn BdevCreateDestroy<Error = BdevError>>, LvsError> {
+        let disks = Self::parse_disks(&args.disks)?;
+
+        let bdev_ops = if let Some(raid_config) = &args.raid_config {
+            let RaidConfig::Raid0(config) = raid_config;
+            let name = args.name.clone();
+            let alias = args.name.clone();
+            let level = &RAID0;
+            let strip_size_kb = config.strip_size_kb;
+            let uuid = args
+                .uuid
+                .as_ref()
+                .map(|s| uuid::Uuid::parse_str(s))
+                .transpose()
+                .ok()
+                .flatten()
+                .unwrap_or_else(uuid::Uuid::new_v4);
+
+            Box::new(LvsRaidBuilder {
+                name,
+                alias,
+                child_uris: disks,
+                level,
+                uuid,
+                strip_size_kb,
+            })
+        } else if disks.len() == 1 {
+            uri::parse(&disks[0]).map_err(|e| LvsError::InvalidBdev {
+                source: e,
+                name: args.name.clone(),
+            })?
+        } else {
+            return Err(LvsError::Invalid {
+                source: BsError::InvalidArgument {},
+                msg: format!("invalid number {} of devices {:?}", disks.len(), disks,),
+            });
+        };
+
+        Ok(bdev_ops)
+    }
+
     // checks for the disks length and parses to correct format
-    pub fn parse_disk(disks: Vec<String>) -> Result<String, LvsError> {
-        let disk = match disks.first() {
-            Some(disk) if disks.len() == 1 => {
-                if Url::parse(disk).is_err() {
-                    format!("aio://{disk}")
-                } else {
-                    disk.clone()
+    pub fn parse_disks(disks: &[String]) -> Result<Vec<String>, LvsError> {
+        disks.iter().map(|disk| Self::parse_disk(disk)).collect()
+    }
+
+    pub fn parse_disk(disk: &str) -> Result<String, LvsError> {
+        if Url::parse(disk).is_err() {
+            // Fail if the disk string starts with a URI scheme (e.g., "<scheme>://")
+            if let Some(idx) = disk.find("://") {
+                if idx > 0 {
+                    return Err(LvsError::Invalid {
+                        source: BsError::InvalidArgument {},
+                        msg: format!("disk URI not allowed: {disk}"),
+                    });
                 }
             }
-            _ => {
-                return Err(LvsError::Invalid {
-                    source: BsError::InvalidArgument {},
-                    msg: format!("invalid number {} of devices {:?}", disks.len(), disks,),
-                })
-            }
-        };
-        Ok(disk)
+            Ok(format!("aio://{disk}"))
+        } else {
+            Ok(disk.to_string())
+        }
     }
 
     /// imports a pool based on its name and base bdev name
@@ -323,12 +472,7 @@ impl Lvs {
     /// imports a pool based on its name, uuid and base bdev name
     #[tracing::instrument(level = "debug", err)]
     pub async fn import_from_args(args: PoolArgs) -> Result<Lvs, LvsError> {
-        let disk = Self::parse_disk(args.disks.clone())?;
-
-        let parsed = uri::parse(&disk).map_err(|e| LvsError::InvalidBdev {
-            source: e,
-            name: args.name.clone(),
-        })?;
+        let parsed = Self::parse_pool_args(&args)?;
 
         // If we are requesting for an encrypted pool, then we should match existing pool(if any)
         // by pool's bdev name as crypto bdev name.
@@ -569,12 +713,10 @@ impl Lvs {
     /// This function creates the underlying bdev if it does not exist.
     #[tracing::instrument(level = "debug", err)]
     pub async fn create_or_import(args: PoolArgs) -> Result<Lvs, LvsError> {
-        let disk = Self::parse_disk(args.disks.clone())?;
-
         info!(
             "Creating or importing {enc} lvs '{}' from '{}'...",
             args.name,
-            disk,
+            args.disks.join(", "),
             enc = if args.crypto_vbdev_name.is_some() {
                 "encrypted"
             } else {
@@ -582,10 +724,7 @@ impl Lvs {
             }
         );
 
-        let bdev_ops = uri::parse(&disk).map_err(|e| LvsError::InvalidBdev {
-            source: e,
-            name: args.name.clone(),
-        })?;
+        let bdev_ops = Self::parse_pool_args(&args)?;
 
         // If we are requesting for an encrypted pool, then we should lookup existing pool(if any)
         // by pool's bdev name as crypto bdev name.
@@ -698,6 +837,80 @@ impl Lvs {
         }
     }
 
+    /// Common cleanup logic for base bdev, including crypto, RAID, and underlying bdev cleanup
+    async fn cleanup_base_bdev(
+        &self,
+        mut base_bdev: UntypedBdev,
+        operation: &str,
+    ) -> Result<(), LvsError> {
+        // If the base_bdev is a crypto vbdev then we need to destroy both - the crypto vbdev and it's base.
+        if base_bdev.driver() == "crypto" {
+            let cbdev = base_bdev.crypto_base_bdev();
+
+            if let Err(e) = destroy_crypto_vbdev(base_bdev.name().to_string(), None).await {
+                error!(
+                    "failed to delete crypto vbdev {:?} during lvs {operation}. {e}",
+                    base_bdev.name()
+                );
+            }
+
+            // A None cbdev here is highly unlikely as the vbdev can't exist in thin air.
+            // If cbdev is somehow None anyway, then the following bdev_destroy will likely
+            // fail, and we can let it.
+            if let Some(c) = cbdev {
+                base_bdev = Bdev::new(c);
+            }
+        }
+
+        let mut base_bdevs: Vec<UntypedBdev> = Vec::new();
+        if let Some(raid_bdev) = base_bdev.as_raid_bdev() {
+            // If the base_bdev is a RAID bdev, we need to collect member disk URIs before
+            // destroying the RAID bdev. SPDK's raid_bdev_delete() only releases member bdevs but
+            // doesn't destroy them, leaving orphaned disks.
+            base_bdevs.extend(raid_bdev.iter_member_bdevs());
+
+            trace!(
+                "RAID bdev {} has {} member disks to clean up during {operation}",
+                base_bdev.name(),
+                base_bdevs.len()
+            );
+
+            raid_bdev.delete().await.map_err(|e| LvsError::Destroy {
+                source: e,
+                name: base_bdev.name().to_string(),
+            })?;
+        } else {
+            base_bdevs.push(base_bdev);
+        }
+
+        let base_bdevs_uris = base_bdevs
+            .into_iter()
+            .filter_map(|bdev| bdev.bdev_uri_original_str().map(|uri| (bdev, uri)));
+
+        // We want to make sure that we delete all devices that we can. We do not stop
+        // processing on the first error encountered, but log errors.
+        // We still make sure to report an LvsError by reporting the first error encountered.
+        let mut first_error: Option<LvsError> = None;
+        for (base_bdev, uri) in base_bdevs_uris {
+            trace!("Deleting bdev {}, uri {:?}", base_bdev.name(), uri);
+
+            if let Err(e) = bdev_destroy(&uri).await {
+                let lvs_error = LvsError::Destroy {
+                    source: e,
+                    name: base_bdev.name().to_string(),
+                };
+
+                error!(
+                    "Failed to clean up bdev {} during lvs {operation}: {lvs_error}",
+                    uri
+                );
+                first_error = first_error.or(Some(lvs_error));
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
     /// export the given lvs
     #[tracing::instrument(level = "debug", err)]
     pub async fn export(self) -> Result<(), LvsError> {
@@ -706,7 +919,7 @@ impl Lvs {
         info!("{}: exporting lvs...", self_str);
 
         let pool = self.name().to_string();
-        let mut base_bdev = self.base_bdev();
+        let base_bdev = self.base_bdev();
         let (s, r) = pair::<i32>();
 
         self.unshare_all().await;
@@ -726,35 +939,7 @@ impl Lvs {
             base_bdev.name()
         );
 
-        // If the base_bdev is a crypto vbdev then we need to destroy both - the crypto vbdev and it's base.
-        if base_bdev.driver() == "crypto" {
-            let cbdev = base_bdev.crypto_base_bdev();
-
-            if let Err(e) = destroy_crypto_vbdev(base_bdev.name().to_string(), None).await {
-                error!(
-                    "failed to delete crypto vbdev {:?} during lvs export. {e}",
-                    base_bdev.name()
-                );
-            }
-
-            // A None cbdev here is highly unlikely as the vbdev can't exist in thin air.
-            // If cbdev is somehow None anyway, then the following bdev_destroy will likely
-            // fail, and we can let it.
-            if let Some(c) = cbdev {
-                base_bdev = Bdev::new(c);
-            }
-        }
-        trace!(
-            "Deleting bdev {}, uri {:?}",
-            base_bdev.name(),
-            base_bdev.bdev_uri_original_str()
-        );
-        if let Some(u) = base_bdev.bdev_uri_original_str() {
-            bdev_destroy(&u).await.map_err(|e| LvsError::Destroy {
-                source: e,
-                name: base_bdev.name().to_string(),
-            })?;
-        }
+        self.cleanup_base_bdev(base_bdev, "export").await?;
 
         Ok(())
     }
@@ -816,7 +1001,7 @@ impl Lvs {
         // when destroying a pool unshare all volumes
         self.unshare_all().await;
 
-        let mut base_bdev = self.base_bdev();
+        let base_bdev = self.base_bdev();
 
         let evt = self.event(EventAction::Delete);
 
@@ -836,36 +1021,7 @@ impl Lvs {
 
         evt.generate();
 
-        // If the base_bdev is a crypto vbdev then we need to destroy both - the crypto vbdev and it's base.
-        if base_bdev.driver() == "crypto" {
-            let cbdev = base_bdev.crypto_base_bdev();
-            let _ = destroy_crypto_vbdev(base_bdev.name().to_string(), None)
-                .await
-                .map_err(|e| {
-                    error!(
-                        "failed to delete crypto vbdev {:?} during pool destroy. {e}",
-                        base_bdev.name()
-                    );
-                });
-
-            // A None cbdev here is highly unlikely as the vbdev can't exist in thin air.
-            // If cbdev is somehow None anyway, then the following bdev_destroy will likely
-            // fail, and we can let it.
-            if let Some(c) = cbdev {
-                base_bdev = Bdev::new(c);
-            }
-        }
-        trace!(
-            "Deleting bdev {}, uri {:?}",
-            base_bdev.name(),
-            base_bdev.bdev_uri_original_str()
-        );
-        if let Some(u) = base_bdev.bdev_uri_original_str() {
-            bdev_destroy(&u).await.map_err(|e| LvsError::Destroy {
-                source: e,
-                name: base_bdev.name().to_string(),
-            })?;
-        }
+        self.cleanup_base_bdev(base_bdev, "destroy").await?;
 
         if let Err(error) = ptpl.destroy() {
             tracing::error!(
