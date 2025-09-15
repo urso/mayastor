@@ -23,6 +23,7 @@ mod nvme;
 mod nvmf;
 pub(crate) mod nvmx;
 mod nx;
+pub(crate) mod raid;
 mod uring;
 pub mod util;
 
