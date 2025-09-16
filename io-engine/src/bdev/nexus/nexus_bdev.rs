@@ -51,8 +51,14 @@ use crate::{
 use crate::core::{BdevStater, BdevStats, CoreError, IoCompletionStatus};
 use events_api::event::EventAction;
 use spdk_rs::{
-    libspdk::spdk_bdev_notify_blockcnt_change, BdevIo, BdevOps, ChannelTraverseStatus, IoChannel,
-    IoDevice, IoDeviceChannelTraverse, JsonWriteContext,
+    libspdk::{
+        spdk_bdev_get_qos_rate_limits, spdk_bdev_notify_blockcnt_change,
+        SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES, SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT,
+        SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT, SPDK_BDEV_QOS_R_BPS_RATE_LIMIT,
+        SPDK_BDEV_QOS_W_BPS_RATE_LIMIT,
+    },
+    BdevIo, BdevOps, ChannelTraverseStatus, IoChannel, IoDevice, IoDeviceChannelTraverse,
+    JsonWriteContext,
 };
 
 pub static NVME_MIN_CNTLID: u16 = 1;
@@ -141,6 +147,43 @@ pub enum NexusNvmePreemption {
     /// An "automatic" preemption where we can preempt whatever is current
     /// holder. Useful when we just want to boot the existing holder out.
     Holder,
+}
+
+/// QoS status for a Nexus bdev from SPDK
+#[derive(Debug, Clone)]
+pub struct NexusQosStatus {
+    /// IOPS limit (read/write operations per second)
+    pub rw_ios_per_sec: Option<u64>,
+    /// Read/Write bandwidth limit in MB/s
+    pub rw_mbytes_per_sec: Option<u64>,
+    /// Read-only bandwidth limit in MB/s
+    pub r_mbytes_per_sec: Option<u64>,
+    /// Write-only bandwidth limit in MB/s
+    pub w_mbytes_per_sec: Option<u64>,
+}
+
+impl NexusQosStatus {
+    pub fn is_configured(&self) -> bool {
+        self.rw_ios_per_sec.is_some()
+            || self.rw_mbytes_per_sec.is_some()
+            || self.r_mbytes_per_sec.is_some()
+            || self.w_mbytes_per_sec.is_some()
+    }
+}
+
+impl From<NexusQosStatus> for io_engine_api::v1::nexus::NexusQos {
+    fn from(qos_status: NexusQosStatus) -> Self {
+        let convert_limit = |limit: Option<u64>| -> Option<u32> {
+            limit.map(|val| val.min(u32::MAX as u64) as u32)
+        };
+
+        io_engine_api::v1::nexus::NexusQos {
+            rw_ios_per_sec: convert_limit(qos_status.rw_ios_per_sec),
+            rw_mbytes_per_sec: convert_limit(qos_status.rw_mbytes_per_sec),
+            r_mbytes_per_sec: convert_limit(qos_status.r_mbytes_per_sec),
+            w_mbytes_per_sec: convert_limit(qos_status.w_mbytes_per_sec),
+        }
+    }
 }
 
 /// NVMe-specific parameters for the Nexus.
@@ -536,6 +579,41 @@ impl<'n> Nexus<'n> {
     /// Returns the alignment of the Nexus.
     pub fn alignment(&self) -> u64 {
         unsafe { self.bdev().alignment() }
+    }
+
+    /// Returns current QoS settings from SPDK for this nexus bdev
+    pub async fn get_qos_status(&self) -> Option<NexusQosStatus> {
+        let mut limits = [0u64; SPDK_BDEV_QOS_NUM_RATE_LIMIT_TYPES as usize];
+
+        // Helper function to convert SPDK limit to Option
+        fn read_limit(value: u64) -> Option<u64> {
+            (value != 0).then_some(value)
+        }
+
+        // SAFETY:
+        // We pass a valid bdev pointer and a valid array pointer to SPDK.
+        // The limits array has the correct size as expected by SPDK.
+        // The bdev pointer is guaranteed valid as long as this nexus exists.
+        // SPDK only writes to the limits array and doesn't retain the pointer.
+        // We cast const ptr to mut ptr because SPDK needs mutable access for thread-safe
+        // reading via internal spinlock, but no other writes on the bdev will occur.
+        unsafe {
+            spdk_bdev_get_qos_rate_limits(
+                self.bdev().unsafe_inner_ptr() as *mut _,
+                limits.as_mut_ptr(),
+            );
+        }
+
+        // spdk_bdev_get_qos_rate_limits already converts bytes→MB/s for bandwidth limits,
+        // no conversion needed.
+        let qos_status = NexusQosStatus {
+            rw_ios_per_sec: read_limit(limits[SPDK_BDEV_QOS_RW_IOPS_RATE_LIMIT as usize]),
+            rw_mbytes_per_sec: read_limit(limits[SPDK_BDEV_QOS_RW_BPS_RATE_LIMIT as usize]),
+            r_mbytes_per_sec: read_limit(limits[SPDK_BDEV_QOS_R_BPS_RATE_LIMIT as usize]),
+            w_mbytes_per_sec: read_limit(limits[SPDK_BDEV_QOS_W_BPS_RATE_LIMIT as usize]),
+        };
+
+        qos_status.is_configured().then_some(qos_status)
     }
 
     /// Returns the required alignment of the Nexus.
