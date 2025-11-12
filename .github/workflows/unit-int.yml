@@ -19,6 +19,7 @@ jobs:
         with:
           fetch-depth: 0
           submodules: 'recursive'
+          token: ${{ secrets.GIT_TOKEN }}
 
       - uses: cachix/install-nix-action@v31.3.0
         with:

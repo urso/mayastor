@@ -1,0 +1,75 @@
+name: Scheduled Sync Upstream
+
+on:
+  schedule:
+    # Daily at 2 AM UTC - commented out until testing is complete
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual trigger for testing
+
+permissions:
+  contents: read
+
+jobs:
+  discover-branches:
+    name: Discover Branches
+    runs-on: ubuntu-latest
+    outputs:
+      branches: ${{ steps.find-branches.outputs.branches }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find branches to sync
+        id: find-branches
+        run: |
+          git fetch origin
+
+          # Find branches matching pattern: develop, develop-*, release/*
+          branches=$(git branch -r | \
+            grep -E 'origin/(develop|develop-.*|release/.*)$' | \
+            sed 's|origin/||' | \
+            sed 's|^[[:space:]]*||' | \
+            grep -v HEAD | \
+            sort -u)
+
+          # Filter: only keep branches that have sync scripts
+          valid_branches=()
+          for branch in $branches; do
+            if git ls-tree -r "origin/$branch" --name-only | grep -q "^scripts/xata/sync-upstream.sh$"; then
+              echo "✅ Including $branch (has sync scripts)"
+              valid_branches+=("$branch")
+            else
+              echo "⏭️  Skipping $branch (no sync scripts)"
+            fi
+          done
+
+          # Convert to JSON array
+          if [ ${#valid_branches[@]} -eq 0 ]; then
+            echo "No valid branches found"
+            echo "branches=[]" >> $GITHUB_OUTPUT
+          else
+            json_branches=$(printf '%s\n' "${valid_branches[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "branches=${json_branches}" >> $GITHUB_OUTPUT
+          fi
+
+  sync-branches:
+    name: Sync ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    needs: discover-branches
+    if: needs.discover-branches.outputs.branches != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.discover-branches.outputs.branches) }}
+    steps:
+      - name: Trigger sync workflow
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          gh workflow run sync-upstream.yml \
+            --repo "${{ github.repository }}" \
+            --ref "${{ matrix.branch }}"
+
+          echo "✅ Triggered sync for branch: ${{ matrix.branch }}"

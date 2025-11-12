@@ -1,0 +1,57 @@
+name: Create Multi-Platform Image
+# Combines architecture-specific images into a single multi-platform image manifest
+
+on:
+  workflow_call:
+    inputs:
+      base_tag:
+        description: 'Base tag without architecture suffix (e.g., v2.9.0 or develop, If not provided, auto-detected from git branch)'
+        required: false
+        type: string
+
+  workflow_dispatch:
+    inputs:
+      base_tag:
+        description: 'Base tag without architecture suffix (leave empty to auto-detect from branch)'
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "390402546598"
+  ARCHITECTURES: "amd64 arm64"
+  IMAGES: "xataio/mayastor-io-engine xataio/mayastor-casperf xataio/mayastor-fio-spdk"
+
+jobs:
+  create-manifest:
+    name: Create Multi-Platform Manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+          token: ${{ secrets.GIT_TOKEN }}
+
+      - name: Setup AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::940241052648:role/xata-gh-docker-build-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "940241052648,390402546598"
+
+      - name: Create and push multi-platform manifests
+        env:
+          REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
+          BASE_TAG: ${{ steps.determine-tag.outputs.base_tag }}
+          ARCHITECTURES: ${{ env.ARCHITECTURES }}
+          IMAGES: ${{ env.IMAGES }}
+        run: ./scripts/xata/create-manifest.sh

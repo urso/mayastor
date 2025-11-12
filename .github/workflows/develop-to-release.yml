@@ -1,17 +1,26 @@
 name: Develop to Release
+# Disabled for this fork - OpenEBS-specific release workflow not applicable
 on:
-  push:
-    branches:
-      - 'release/**'
+  workflow_dispatch:
+# Original triggers (disabled):
+#  push:
+#    branches:
+#      - 'release/**'
+
 jobs:
   prepareReleaseBranch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GIT_TOKEN }}
       - name: Check if the submodules are correct
         run: |
           branch="${{ github.ref_name }}"
-          ./scripts/set-submodule-branches.sh --branch "$branch"
+          ./scripts/git/set-submodule-branches.sh --branch "$branch"
+          ./scripts/rust/branch_ancestor.sh
       - name: Create Pull Request
         id: cpr
         uses: peter-evans/create-pull-request@v5
@@ -25,7 +34,7 @@ jobs:
             automated-pr
           draft: false
           signoff: true
-          token: ${{ secrets.ORG_CI_GITHUB }}
+          token: ${{ secrets.GIT_TOKEN }}
       - name: Approve Pull Request by CI Bot
         if: ${{ steps.cpr.outputs.pull-request-number }}
         run: |
@@ -37,11 +46,10 @@ jobs:
         run: |
           gh pr review ${{ steps.cpr.outputs.pull-request-number }} --approve
         env:
-          GH_TOKEN: ${{ secrets.ORG_CI_GITHUB_2 }}
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
       - name: Bors Merge Pull Request
         if: ${{ steps.cpr.outputs.pull-request-number }}
         run: |
           gh pr comment ${{ steps.cpr.outputs.pull-request-number }} --body "bors merge"
         env:
-          GH_TOKEN: ${{ secrets.ORG_CI_GITHUB }}
-
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}

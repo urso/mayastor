@@ -1,0 +1,229 @@
+name: Sync Upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: 'Upstream branch (leave empty for auto-detect)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync with Upstream
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          token: ${{ secrets.GIT_TOKEN }}
+
+      - name: Check for existing sync PR
+        id: check-pr
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          EXISTING_PR=$(gh pr list \
+            --repo "${{ github.repository }}" \
+            --base "${{ github.ref_name }}" \
+            --label "upstream-sync" \
+            --state open \
+            --json number,title \
+            --jq '.[0] // empty')
+
+          if [ -n "$EXISTING_PR" ]; then
+            PR_NUM=$(echo "$EXISTING_PR" | jq -r '.number')
+            PR_TITLE=$(echo "$EXISTING_PR" | jq -r '.title')
+            echo "found=true" >> $GITHUB_OUTPUT
+            echo "number=${PR_NUM}" >> $GITHUB_OUTPUT
+            echo "⚠️ Found existing sync PR #${PR_NUM}: ${PR_TITLE}"
+            echo "Skipping sync to avoid duplicates"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate sync branch name
+        if: steps.check-pr.outputs.found == 'false'
+        id: sync-branch
+        run: |
+          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+          SYNC_BRANCH="sync-upstream/${{ github.ref_name }}-${TIMESTAMP}"
+          echo "name=${SYNC_BRANCH}" >> $GITHUB_OUTPUT
+
+      - name: Create sync branch
+        if: steps.check-pr.outputs.found == 'false'
+        run: git checkout -b "${{ steps.sync-branch.outputs.name }}"
+
+      - name: Run upstream sync
+        if: steps.check-pr.outputs.found == 'false'
+        id: sync
+        env:
+          GIT_AUTHOR_NAME: 'Xata Bot'
+          GIT_AUTHOR_EMAIL: 'xata-bot@users.noreply.github.com'
+          GIT_COMMITTER_NAME: 'Xata Bot'
+          GIT_COMMITTER_EMAIL: 'xata-bot@users.noreply.github.com'
+        run: |
+          CMD="./scripts/xata/sync-upstream.sh --target-branch ${{ github.ref_name }}"
+          if [ -n "${{ inputs.upstream_branch }}" ]; then
+            CMD="$CMD --upstream-branch ${{ inputs.upstream_branch }}"
+          fi
+
+          echo "Running: $CMD"
+          $CMD
+          echo "exit_code=$?" >> $GITHUB_OUTPUT
+
+      - name: Update xataio submodules
+        if: steps.check-pr.outputs.found == 'false'
+        id: update-submodules
+        env:
+          GIT_AUTHOR_NAME: 'Xata Bot'
+          GIT_AUTHOR_EMAIL: 'xata-bot@users.noreply.github.com'
+          GIT_COMMITTER_NAME: 'Xata Bot'
+          GIT_COMMITTER_EMAIL: 'xata-bot@users.noreply.github.com'
+        run: |
+          echo "Updating xataio submodules (only if changed in upstream merge)..."
+          ./scripts/xata/update-submodules.sh --only-if-changed
+
+          # Check if submodule updates created any changes
+          if git diff --quiet && git diff --staged --quiet; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No submodule changes detected"
+          else
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Submodule changes detected"
+
+            # Commit the changes
+            if [ "${{ steps.sync.outputs.exit_code }}" = "0" ] || [ "${{ steps.sync.outputs.exit_code }}" = "1" ]; then
+              # Amend the merge commit if we had upstream changes (clean or conflicts)
+              git commit --amend --no-edit
+              echo "Amended merge commit with submodule updates"
+            elif [ "${{ steps.sync.outputs.exit_code }}" = "2" ]; then
+              # Create new commit if only submodules changed (upstream was up-to-date)
+              git commit -m "chore: update xataio submodules"
+              echo "Created new commit for submodule updates"
+            fi
+          fi
+
+      - name: Push sync branch
+        if: (steps.sync.outputs.exit_code == '0' || steps.sync.outputs.exit_code == '1') || steps.update-submodules.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: git push -u origin "${{ steps.sync-branch.outputs.name }}"
+
+      - name: Create pull request
+        if: (steps.sync.outputs.exit_code == '0' || steps.sync.outputs.exit_code == '1') || steps.update-submodules.outputs.has_changes == 'true'
+        id: create-pr
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          # Determine upstream branch for display
+          UPSTREAM_BRANCH="${{ inputs.upstream_branch }}"
+          if [ -z "$UPSTREAM_BRANCH" ]; then
+            case "${{ github.ref_name }}" in
+              develop|develop-*) UPSTREAM_BRANCH="develop" ;;
+              release/*) UPSTREAM_BRANCH=$(echo "${{ github.ref_name }}" | sed -E 's|(release/[0-9]+\.[0-9]+).*|\1|') ;;
+              *) UPSTREAM_BRANCH="${{ github.ref_name }}" ;;
+            esac
+          fi
+
+          # Determine what changed
+          CHANGES=""
+          if [ "${{ steps.sync.outputs.exit_code }}" = "0" ]; then
+            CHANGES="upstream (clean merge)"
+            STATUS="✅ Clean merge"
+          elif [ "${{ steps.sync.outputs.exit_code }}" = "1" ]; then
+            CHANGES="upstream (conflicts)"
+            STATUS="⚠️ Merge conflicts"
+          fi
+
+          if [ "${{ steps.update-submodules.outputs.has_changes }}" = "true" ]; then
+            if [ -n "$CHANGES" ]; then
+              CHANGES="$CHANGES + submodules"
+            else
+              CHANGES="submodules only"
+              STATUS="✅ Submodule updates"
+            fi
+          fi
+
+          # Set PR title
+          PR_DATE=$(date +%Y-%m-%d)
+          if [ "${{ steps.sync.outputs.exit_code }}" = "1" ]; then
+            PR_TITLE="chore: sync upstream changes (${{ github.ref_name }}) - ${PR_DATE} [CONFLICTS]"
+          else
+            PR_TITLE="chore: sync upstream changes (${{ github.ref_name }}) - ${PR_DATE}"
+          fi
+
+          # Determine labels to add at creation time
+          LABELS="upstream-sync,automated"
+          if [ "${{ steps.sync.outputs.exit_code }}" = "1" ]; then
+            LABELS="${LABELS},conflicts,manual-review-required"
+          fi
+
+          # Create PR with labels and extract PR number from URL
+          PR_URL=$(gh pr create \
+            --repo "${{ github.repository }}" \
+            --base "${{ github.ref_name }}" \
+            --head "${{ steps.sync-branch.outputs.name }}" \
+            --title "${PR_TITLE}" \
+            --label "${LABELS}" \
+            --body "## Upstream Sync
+
+          **Source:** \`openebs/mayastor\` (\`${UPSTREAM_BRANCH}\`)
+          **Target:** \`${{ github.ref_name }}\`
+          **Changes:** ${CHANGES}
+          **Status:** ${STATUS}
+
+          *Automated sync from upstream repository.*")
+
+          # Extract PR number from URL (e.g., https://github.com/owner/repo/pull/123)
+          PR_NUMBER=$(echo "$PR_URL" | sed 's#.*/pull/##')
+          echo "number=${PR_NUMBER}" >> $GITHUB_OUTPUT
+          echo "Created PR #${PR_NUMBER} with labels: ${LABELS}"
+
+      - name: Auto-approve PR
+        if: steps.sync.outputs.exit_code != '1' && steps.create-pr.outputs.number != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh pr review "${{ steps.create-pr.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --approve \
+            --body "Auto-approved by GitHub Actions"
+
+      - name: Enable auto-merge
+        if: steps.sync.outputs.exit_code != '1' && steps.create-pr.outputs.number != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          gh pr merge "${{ steps.create-pr.outputs.number }}" \
+            --repo "${{ github.repository }}" \
+            --auto --merge --delete-branch
+
+      - name: Summary
+        if: always()
+        run: |
+          if [ "${{ steps.check-pr.outputs.found }}" = "true" ]; then
+            echo "⚠️ Skipped - Existing PR #${{ steps.check-pr.outputs.number }} already open"
+            exit 0
+          fi
+
+          if [ "${{ steps.sync.outputs.exit_code }}" = "2" ] && [ "${{ steps.update-submodules.outputs.has_changes }}" != "true" ]; then
+            echo "✓ Already up-to-date - no changes to sync"
+            exit 0
+          fi
+
+          case "${{ steps.sync.outputs.exit_code }}" in
+            0) echo "✅ Clean merge - PR #${{ steps.create-pr.outputs.number }} created with auto-merge" ;;
+            1) echo "⚠️ Merge conflicts - PR #${{ steps.create-pr.outputs.number }} created (manual review required)" ;;
+            2) echo "✅ Submodule updates - PR #${{ steps.create-pr.outputs.number }} created with auto-merge" ;;
+            *) echo "❌ Sync failed with exit code: ${{ steps.sync.outputs.exit_code }}" ;;
+          esac

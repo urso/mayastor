@@ -1,0 +1,35 @@
+name: Pull Request CI
+on:
+  pull_request:
+    types: ['opened', 'edited', 'reopened', 'synchronize']
+
+# This workflow replaces the Bors CI workflow from upstream
+# It runs lightweight checks that work on GitHub's free hosted runners
+# Heavy tests (unit-int, bdd) are disabled until self-hosted runners are available
+
+jobs:
+  lint-ci:
+    uses: ./.github/workflows/lint.yml
+    secrets: inherit
+
+  # Disabled - requires self-hosted runners with 16 CPUs and 64GB RAM
+  # int-ci:
+  #   uses: ./.github/workflows/unit-int.yml
+
+  # Disabled - requires self-hosted runners with 16 CPUs and 64GB RAM
+  # bdd-ci:
+  #   uses: ./.github/workflows/bdd.yml
+
+  # Disabled - requires Docker Hub credentials
+  # image-ci:
+  #   uses: ./.github/workflows/image-pr.yml
+
+  ci-success:
+    name: All CI checks passed
+    if: ${{ success() }}
+    needs:
+      - lint-ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: CI succeeded
+        run: echo "All CI checks passed successfully"

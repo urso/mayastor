@@ -1,20 +1,29 @@
 name: Bors CI
+# Disabled for this fork - Bors merge bot not used
+# Use pull-request.yml instead for PR CI
 on:
   workflow_call:
-  push:
-    branches:
-      - staging
-      - trying
+  workflow_dispatch:
+# Original triggers (disabled):
+#  workflow_call:
+#  push:
+#    branches:
+#      - staging
+#      - trying
 
 jobs:
   lint-ci:
     uses: ./.github/workflows/lint.yml
+    secrets: inherit
   int-ci:
     uses: ./.github/workflows/unit-int.yml
+    secrets: inherit
   bdd-ci:
     uses: ./.github/workflows/bdd.yml
+    secrets: inherit
   image-ci:
     uses: ./.github/workflows/image-pr.yml
+    secrets: inherit
   bors-ci:
     if: ${{ success() }}
     needs:

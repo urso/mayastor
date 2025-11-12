@@ -1,25 +1,43 @@
 name: Image Push
+# Build and push multi-platform images to AWS ECR
 on:
-  push:
-    branches:
-      - develop
-      - 'release/**'
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+**'
+  workflow_dispatch:
+# Future triggers (disabled for now):
+#  push:
+#    branches:
+#      - develop
+#      - 'release/**'
+#    tags:
+#      - 'v[0-9]+.[0-9]+.[0-9]+**'
+
+permissions:
+  id-token: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
   CI: 1
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: "390402546598"
+  # List of images to build (hardcoded for now)
+  IMAGES: "mayastor.io-engine mayastor.casperf fio-spdk"
 
 jobs:
-  image-build-push:
+  build-amd64:
+    name: Build AMD64 Images
     runs-on: ubuntu-latest
+    outputs:
+      registry: ${{ steps.build.outputs.registry }}
+      tag: ${{ steps.build.outputs.tag }}
+      base_tag: ${{ steps.build.outputs.base_tag }}
+      arch: ${{ steps.build.outputs.arch }}
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: 'recursive'
           fetch-depth: 0
+          token: ${{ secrets.GIT_TOKEN }}
       - run: |
           # BUG: HEAD tag is fetched as lightweight instead of annotated
           # https://github.com/actions/checkout/issues/290
@@ -27,10 +45,67 @@ jobs:
             git fetch -f origin ${{ github.ref }}:${{ github.ref }}
           fi
       - uses: cachix/install-nix-action@v31.3.0
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
+
+      - name: Setup AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - name: Build and push the release images
-        run: ./scripts/release.sh
+          role-to-assume: arn:aws:iam::940241052648:role/xata-gh-docker-build-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "940241052648,390402546598"
+
+      - name: Build and push AMD64 images to ECR
+        id: build
+        env:
+          ARCH: amd64
+        run: ./scripts/xata/build-and-push-ecr.sh
+
+  build-arm64:
+    name: Build ARM64 Images
+    runs-on: linux-arm64
+    outputs:
+      registry: ${{ steps.build.outputs.registry }}
+      tag: ${{ steps.build.outputs.tag }}
+      base_tag: ${{ steps.build.outputs.base_tag }}
+      arch: ${{ steps.build.outputs.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+          fetch-depth: 0
+          token: ${{ secrets.GIT_TOKEN }}
+      - run: |
+          # BUG: HEAD tag is fetched as lightweight instead of annotated
+          # https://github.com/actions/checkout/issues/290
+          if [ "${{ github.ref_type }}" == "tag" ]; then
+            git fetch -f origin ${{ github.ref }}:${{ github.ref }}
+          fi
+      - uses: cachix/install-nix-action@v31.3.0
+
+      - name: Setup AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::940241052648:role/xata-gh-docker-build-push
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registries: "940241052648,390402546598"
+
+      - name: Build and push ARM64 images to ECR
+        id: build
+        env:
+          ARCH: arm64
+        run: ./scripts/xata/build-and-push-ecr.sh
+
+  create-multi-platform-image:
+    name: Create Multi-Platform Image
+    needs: [build-amd64, build-arm64]
+    uses: ./.github/workflows/create-multi-platform-image.yml
+    secrets: inherit
+    with:
+      base_tag: ${{ needs.build-amd64.outputs.base_tag }}

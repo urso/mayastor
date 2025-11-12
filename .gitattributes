@@ -1,0 +1,3 @@
+# Merge strategy for files we never want to update from upstream
+.github/CODEOWNERS merge=ours
+.github/workflows/image.yml merge=ours
