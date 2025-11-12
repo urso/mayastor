@@ -76,8 +76,18 @@ jobs:
           fi
 
           echo "Running: $CMD"
+          set +e  # Disable exit on error to capture exit code
           $CMD
-          echo "exit_code=$?" >> $GITHUB_OUTPUT
+          EXIT_CODE=$?
+          set -e  # Re-enable exit on error
+          echo "exit_code=${EXIT_CODE}" >> $GITHUB_OUTPUT
+
+          # Exit codes 0, 1, 2 are expected (success, conflicts, up-to-date)
+          # Any other code is an actual error
+          if [ ${EXIT_CODE} -ne 0 ] && [ ${EXIT_CODE} -ne 1 ] && [ ${EXIT_CODE} -ne 2 ]; then
+            echo "❌ Sync script failed with unexpected exit code: ${EXIT_CODE}"
+            exit ${EXIT_CODE}
+          fi
 
       - name: Update xataio submodules
         if: steps.check-pr.outputs.found == 'false'
