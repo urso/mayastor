@@ -261,6 +261,7 @@ async fn test_rdma_target() {
             cluster_size: None,
             md_args: None,
             encryption: None,
+            xata_raid_config: None,
         })
         .await
         .unwrap();

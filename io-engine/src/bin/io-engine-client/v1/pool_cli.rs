@@ -341,6 +341,7 @@ async fn create(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
                 max_expansion,
             }),
             encryption: enc_msg,
+            xata_raid_config: None,
         })
         .await
         .context(GrpcStatus)?;
@@ -460,6 +461,7 @@ async fn import(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
             disks: disks_list,
             pooltype: v1rpc::pool::PoolType::from(pooltype) as i32,
             encryption: enc_msg,
+            xata_raid_config: None,
         })
         .await
         .context(GrpcStatus)?;

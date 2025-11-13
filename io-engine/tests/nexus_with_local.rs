@@ -47,6 +47,7 @@ async fn create_replicas(h: &mut RpcHandle) {
             cluster_size: None,
             md_args: None,
             encryption: None,
+            xata_raid_config: None,
         })
         .await
         .unwrap();
