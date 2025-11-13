@@ -38,7 +38,8 @@ pub(crate) mod uri {
 
     use crate::{
         bdev::{
-            aio, ftl, loopback, lvs, malloc, null_bdev, nvme, nvmx, nx, uring, BdevCreateDestroy,
+            aio, ftl, loopback, lvs, malloc, null_bdev, nvme, nvmx, nx, raid, uring,
+            BdevCreateDestroy,
         },
         bdev_api::{self, BdevError},
     };
@@ -61,6 +62,7 @@ pub(crate) mod uri {
                 Ok(Box::new(nvmx::NvmfDeviceTemplate::try_from(&url)?))
             }
             "pcie" => Ok(Box::new(nvme::NVMe::try_from(&url)?)),
+            "raid0" | "raid1" | "raid5f" | "concat" => Ok(Box::new(raid::Raid::try_from(&url)?)),
             "uring" => Ok(Box::new(uring::Uring::try_from(&url)?)),
             "nexus" => Ok(Box::new(nx::Nexus::try_from(&url)?)),
             "lvol" => Ok(Box::new(lvs::Lvol::try_from(&url)?)),
