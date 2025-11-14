@@ -31,7 +31,7 @@ use crate::{
     bdev_api::BdevError,
     core::LogicalVolume,
     lvs::LvsLvol,
-    pool_backend::{PoolArgs, PoolBackend},
+    pool_backend::{PoolArgs, PoolBackend, Raid0Config, RaidConfig},
 };
 
 use super::crypto::EncryptionKey;
@@ -48,12 +48,14 @@ pub(super) struct Lvol {
 struct Lvs {
     /// Name of the lvs.
     name: String,
-    /// The backing bdev disk uri.
-    disk: String,
+    /// The backing bdev disk uris.
+    disks: Vec<String>,
     /// The lvs creation mode.
     mode: LvsMode,
     // Encryption key - if the lvs is encrypted.
     key: Option<EncryptionKey>,
+    /// Pool configuration for RAID.
+    raid_config: Option<RaidConfig>,
 }
 
 impl Debug for Lvol {
@@ -63,7 +65,7 @@ impl Debug for Lvol {
 }
 impl Debug for Lvs {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Lvs '{}' <== {}", self.name, self.disk)
+        write!(f, "Lvs '{}' <== {:?}", self.name, self.disks)
     }
 }
 
@@ -101,9 +103,15 @@ impl TryFrom<&Url> for Lvol {
                 uri: uri.to_string(),
                 message: "'lvs' must be specified".to_string(),
             })
-            .and_then(|lvs| {
-                let disk = parameters.remove("disk").unwrap_or_default();
-                Lvs::try_from(format!("{lvs}&disk={disk}"))
+            .and_then(|lvs_uri| {
+                let extended_uri = parameters
+                    .iter()
+                    .filter(|(key, _)| matches!(key.as_str(), "disk" | "raid" | "strip_size"))
+                    .fold(lvs_uri, |mut uri, (key, value)| {
+                        uri.push_str(&format!("&{key}={value}"));
+                        uri
+                    });
+                Lvs::try_from(extended_uri)
             })?;
 
         reject_unknown_parameters(uri, parameters)?;
@@ -131,10 +139,23 @@ impl TryFrom<String> for Lvs {
 
         let mut parameters: HashMap<String, String> = uri.query_pairs().into_owned().collect();
 
-        let disk = parameters.remove("disk").ok_or(BdevError::InvalidUri {
-            uri: uri.to_string(),
-            message: "'disk' must be specified".to_string(),
-        })?;
+        // Parse disks - support multiple disk parameters for RAID
+        let disks: Vec<String> = parameters
+            .remove("disk")
+            .map(|disks| {
+                disks
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if disks.is_empty() {
+            return Err(BdevError::InvalidUri {
+                uri: uri.to_string(),
+                message: "at least one 'disk' must be specified".to_string(),
+            });
+        }
 
         let mode = parameters
             .remove("mode")
@@ -144,11 +165,42 @@ impl TryFrom<String> for Lvs {
             })
             .map(LvsMode::from)?;
 
+        // Parse RAID configuration
+        let raid_config = parameters
+            .remove("raid")
+            .map(|raid_type| match raid_type.as_str() {
+                "raid0" => {
+                    if disks.len() < 2 {
+                        return Err(BdevError::InvalidUri {
+                            uri: uri.to_string(),
+                            message: "RAID0 requires at least 2 disks".to_string(),
+                        });
+                    }
+                    let strip_size_kb = parameters
+                        .remove("strip_size")
+                        .unwrap_or_else(|| "64".to_string())
+                        .parse::<u32>()
+                        .map_err(|_| BdevError::InvalidUri {
+                            uri: uri.to_string(),
+                            message: "invalid strip_size value".to_string(),
+                        })?;
+                    Ok(RaidConfig::Raid0(Raid0Config { strip_size_kb }))
+                }
+                _ => Err(BdevError::InvalidUri {
+                    uri: uri.to_string(),
+                    message: format!("unsupported RAID type: {raid_type}"),
+                }),
+            })
+            .transpose()?;
+
+        reject_unknown_parameters(&uri, parameters)?;
+
         Ok(Lvs {
             name: uri.path()[1..].into(),
-            disk,
+            disks,
             mode,
             key: None,
+            raid_config,
         })
     }
 }
@@ -209,7 +261,7 @@ impl Lvs {
     async fn create(&self) -> Result<crate::lvs::Lvs, BdevError> {
         let args = PoolArgs {
             name: self.name.to_owned(),
-            disks: vec![self.disk.to_owned()],
+            disks: self.disks.clone(),
             uuid: None,
             cluster_size: None,
             md_args: None,
@@ -217,7 +269,7 @@ impl Lvs {
             enc_key: self.key.clone(),
             // XXX: Is this path ever exercised apart from test, or casperf perhaps?
             crypto_vbdev_name: self.key.as_ref().map(|_| format!("crypto_{}", self.name)),
-            raid_config: None,
+            raid_config: self.raid_config.clone(),
         };
         match &self.mode {
             LvsMode::Create => match crate::lvs::Lvs::import_from_args(args.clone()).await {
@@ -244,31 +296,45 @@ impl Lvs {
     }
 
     async fn wipe_super(args: PoolArgs) -> Result<(), BdevError> {
-        let disk =
-            crate::lvs::Lvs::parse_disk(args.disks.clone()).map_err(|_| BdevError::InvalidUri {
+        let disks =
+            crate::lvs::Lvs::parse_disks(&args.disks).map_err(|_| BdevError::InvalidUri {
                 uri: String::new(),
                 message: String::new(),
             })?;
 
-        let parsed = super::uri::parse(&disk)?;
-        let bdev_str = parsed.create().await?;
-        {
-            let bdev = crate::core::Bdev::get_by_name(&bdev_str)
-                .map_err(|_| BdevError::BdevNotFound { name: bdev_str })?;
+        if disks.is_empty() {
+            return Err(BdevError::InvalidUri {
+                uri: String::new(),
+                message: "No disks provided".to_string(),
+            });
+        }
 
-            let hdl = crate::core::Bdev::open(&bdev, true)
-                .and_then(|desc| desc.into_handle())
-                .map_err(|_| BdevError::BdevNotFound {
-                    name: bdev.name().into(),
+        for disk in &disks {
+            let parsed = super::uri::parse(disk)?;
+            let bdev_str = parsed.create().await?;
+            {
+                let bdev = crate::core::Bdev::get_by_name(&bdev_str).map_err(|_| {
+                    BdevError::BdevNotFound {
+                        name: bdev_str.clone(),
+                    }
                 })?;
 
-            let mut wiper =
-                crate::core::wiper::Wiper::new(hdl, crate::core::wiper::WipeMethod::WriteZeroes)
-                    .map_err(|_| BdevError::WipeFailed {})?;
-            wiper
-                .wipe(0, 8 * 1024 * 1024)
-                .await
+                let hdl = crate::core::Bdev::open(&bdev, true)
+                    .and_then(|desc| desc.into_handle())
+                    .map_err(|_| BdevError::BdevNotFound {
+                        name: bdev.name().into(),
+                    })?;
+
+                let mut wiper = crate::core::wiper::Wiper::new(
+                    hdl,
+                    crate::core::wiper::WipeMethod::WriteZeroes,
+                )
                 .map_err(|_| BdevError::WipeFailed {})?;
+                wiper
+                    .wipe(0, 8 * 1024 * 1024)
+                    .await
+                    .map_err(|_| BdevError::WipeFailed {})?;
+            }
         }
         // We can't destroy the device here as this causes issues with the next
         // section. Seems the deletion of nvme device is not sync as

@@ -275,6 +275,10 @@ pub enum LvsError {
     BdevNotExtended {
         name: String,
     },
+    #[snafu(display("Failed to resize RAID bdev: {name}"))]
+    RaidBdevNotResized {
+        name: String,
+    },
     #[snafu(display("Failed to resize crypto bdev: {name}"))]
     CryptoBdevNotResized {
         name: String,
@@ -317,6 +321,7 @@ impl ToErrno for LvsError {
             Self::MaxExpansionParse { .. } => Errno::EINVAL,
             Self::BdevRescanFailed { source, .. } => source.to_errno(),
             Self::BdevNotExtended { .. } => Errno::EOPNOTSUPP,
+            Self::RaidBdevNotResized { .. } => Errno::EBUSY,
             Self::CryptoBdevNotResized { .. } => Errno::EBUSY,
         }
     }
