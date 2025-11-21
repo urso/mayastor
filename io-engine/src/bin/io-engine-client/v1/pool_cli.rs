@@ -77,6 +77,20 @@ pub fn subcommands() -> Command {
                 .help("encryption key2 required for AES_XTS")
                 .required(false)
                 .required_if_eq("cipher", "AES_XTS"),
+        )
+        .arg(
+            Arg::new("raid")
+                .long("raid")
+                .help("RAID level for LVS pools")
+                .required(false)
+                .value_parser(["raid0"]),
+        )
+        .arg(
+            Arg::new("raid-strip-size")
+                .long("raid-strip-size")
+                .help("RAID strip size in KB (default: 64)")
+                .required(false)
+                .requires("raid"),
         );
 
     let import = Command::new("import")
@@ -132,6 +146,20 @@ pub fn subcommands() -> Command {
                 .help("encryption key2 required for AES_XTS")
                 .required_if_eq("cipher", "AES_XTS")
                 .required(false),
+        )
+        .arg(
+            Arg::new("raid")
+                .long("raid")
+                .help("RAID level for LVS pools")
+                .required(false)
+                .value_parser(["raid0"]),
+        )
+        .arg(
+            Arg::new("raid-strip-size")
+                .long("raid-strip-size")
+                .help("RAID strip size in KB (default: 64)")
+                .required(false)
+                .requires("raid"),
         );
 
     let destroy = Command::new("destroy")
@@ -327,6 +355,8 @@ async fn create(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
         })
     });
 
+    let raid_config = parse_raid_config(matches, &pooltype).context(GrpcStatus)?;
+
     let response = ctx
         .v1
         .pool
@@ -341,7 +371,7 @@ async fn create(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
                 max_expansion,
             }),
             encryption: enc_msg,
-            xata_raid_config: None,
+            xata_raid_config: raid_config,
         })
         .await
         .context(GrpcStatus)?;
@@ -452,6 +482,8 @@ async fn import(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
         })
     });
 
+    let raid_config = parse_raid_config(matches, &pooltype).context(GrpcStatus)?;
+
     let response = ctx
         .v1
         .pool
@@ -461,7 +493,7 @@ async fn import(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
             disks: disks_list,
             pooltype: v1rpc::pool::PoolType::from(pooltype) as i32,
             encryption: enc_msg,
-            xata_raid_config: None,
+            xata_raid_config: raid_config,
         })
         .await
         .context(GrpcStatus)?;
@@ -685,6 +717,12 @@ async fn list(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
                             )
                         };
 
+                    let raid_level = p
+                        .xata_raid_info
+                        .as_ref()
+                        .map(|r| format!("{} ({})", r.level, r.state))
+                        .unwrap_or_else(|| "none".to_string());
+
                     vec![
                         p.name.clone(),
                         p.uuid.clone(),
@@ -701,6 +739,7 @@ async fn list(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
                         p.disks.join(" "),
                         ctx.units(disk_cap),
                         p.encrypted.unwrap_or_default().to_string(),
+                        raid_level,
                     ]
                 })
                 .collect();
@@ -721,6 +760,7 @@ async fn list(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
                     "DISKS",
                     "DISK_CAPACITY",
                     "ENCRYPTED",
+                    "RAID",
                 ],
                 table,
             );
@@ -728,6 +768,44 @@ async fn list(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
     };
 
     Ok(())
+}
+
+/// Parse pool configuration from command line arguments
+fn parse_raid_config(
+    matches: &ArgMatches,
+    pooltype: &PoolType,
+) -> Result<Option<v1rpc::pool::XataRaidConfig>, Status> {
+    let raid_level = matches.get_one::<String>("raid");
+    if raid_level.is_none() {
+        return Ok(None);
+    }
+
+    if !matches!(pooltype, PoolType::Lvs) {
+        return Err(Status::invalid_argument(
+            "RAID configuration is only supported for LVS pools",
+        ));
+    }
+
+    let strip_size_kb = matches
+        .get_one::<String>("raid-strip-size")
+        .map(|s| {
+            s.parse::<u32>()
+                .map_err(|err| Status::invalid_argument(format!("Invalid strip size: {err}")))
+        })
+        .transpose()?
+        .unwrap_or(64);
+
+    match raid_level.map(|s| s.as_str()) {
+        Some("raid0") => Ok(Some(v1rpc::pool::XataRaidConfig {
+            config: Some(v1rpc::pool::xata_raid_config::Config::Raid0(
+                v1rpc::pool::Raid0Config { strip_size_kb },
+            )),
+        })),
+        Some(level) => Err(Status::invalid_argument(format!(
+            "Unsupported RAID level: {level}"
+        ))),
+        None => Ok(None),
+    }
 }
 
 fn pool_state_to_str(idx: i32) -> &'static str {
