@@ -4,7 +4,7 @@ use io_engine::{
     bdev_api::bdev_create,
     core::{logical_volume::LogicalVolume, MayastorCliArgs, Protocol, Share, UntypedBdev},
     lvs::{Lvs, LvsLvol, PropName, PropValue},
-    pool_backend::{PoolArgs, PoolBackend},
+    pool_backend::{PoolArgs, PoolBackend, Raid0Config, RaidConfig},
     subsys::NvmfSubsystem,
 };
 use std::pin::Pin;
@@ -16,6 +16,8 @@ static DISKNAME1: &str = "/tmp/io-engine-tests/disk1.img";
 static DISKNAME2: &str = "/tmp/io-engine-tests/disk2.img";
 static DISKNAME3: &str = "/tmp/io-engine-tests/disk3.img";
 static DISK_CRYPTO: &str = "/tmp/io-engine-tests/crypto_disk.img";
+static RAID0_DISK1: &str = "/tmp/io-engine-tests/raid0_persist_disk1.img";
+static RAID0_DISK2: &str = "/tmp/io-engine-tests/raid0_persist_disk2.img";
 static XTS_KEY: &str = "2b7e151628aed2a6abf7158809cf4f3c";
 static XTS_KEY2: &str = "2b7e151628aed2a6abf7158809cf4f3d";
 
@@ -34,11 +36,15 @@ async fn lvs_pool_test() {
         DISKNAME2.into(),
         DISKNAME3.into(),
         DISK_CRYPTO.into(),
+        RAID0_DISK1.into(),
+        RAID0_DISK2.into(),
     ]);
     common::truncate_file(DISKNAME1, 128 * 1024);
     common::truncate_file(DISKNAME2, 128 * 1024);
     common::truncate_file(DISKNAME3, 128 * 1024);
     common::truncate_file(DISK_CRYPTO, 128 * 1024);
+    common::truncate_file(RAID0_DISK1, 64 * 1024);
+    common::truncate_file(RAID0_DISK2, 64 * 1024);
 
     //setup disk3 via loop device using a sector size of 4096.
     let ldev = common::setup_loopdev_file(DISKNAME3, Some(4096));
@@ -66,6 +72,7 @@ async fn lvs_pool_test() {
         backend: PoolBackend::Lvs,
         enc_key: None,
         crypto_vbdev_name: None,
+        raid_config: None,
     };
 
     // should succeed to create a pool we can not import
@@ -153,6 +160,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .is_ok());
@@ -187,6 +195,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -227,6 +236,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -368,6 +378,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -392,6 +403,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -422,6 +434,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -462,6 +475,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .err()
@@ -482,6 +496,7 @@ async fn lvs_pool_test() {
             backend: PoolBackend::Lvs,
             enc_key: None,
             crypto_vbdev_name: None,
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -511,6 +526,7 @@ async fn lvs_pool_test() {
                 key2_len: Some(128),
             }),
             crypto_vbdev_name: Some("crypto_enc_pool".into()),
+            raid_config: None,
         })
         .await
         .unwrap();
@@ -537,6 +553,280 @@ async fn lvs_pool_test() {
         futures::future::join_all(dest).await;
         pool.destroy().await.unwrap();
         common::delete_file(&[DISK_CRYPTO.into()]);
+    })
+    .await;
+
+    // RAID0 Pool Lifecycle Tests
+    ms.spawn(async {
+        println!("=== RAID0 Pool Creation/Destruction Test - Starting ===");
+
+        // Test 1: Basic RAID0 pool creation with default strip size
+        let pool_args = PoolArgs {
+            name: "raid0_pool".into(),
+            disks: vec![
+                "malloc:///raid0_malloc0?size_mb=64".to_string(),
+                "malloc:///raid0_malloc1?size_mb=64".to_string(),
+            ],
+            uuid: None,
+            cluster_size: None,
+            md_args: None,
+            backend: PoolBackend::Lvs,
+            enc_key: None,
+            crypto_vbdev_name: None,
+            raid_config: Some(RaidConfig::Raid0(Raid0Config::default())),
+        };
+
+        // Create RAID0 pool
+        let pool = Lvs::create_or_import(pool_args).await.unwrap();
+
+        // Verify pool was created successfully
+        assert_eq!(pool.name(), "raid0_pool");
+
+        // Verify capacity calculation (should be ~128MB total from 2x64MB devices)
+        // Following Task 1 pattern: 128 * 1024 * 1024 = 134,217,728 bytes
+        let max_capacity = 128 * 1024 * 1024;
+        let actual_capacity = pool.capacity();
+        println!(
+            "RAID0 pool capacity: {} bytes ({} MB), expected: {} bytes",
+            actual_capacity,
+            actual_capacity / (1024 * 1024),
+            max_capacity
+        );
+
+        // Allow some tolerance for metadata overhead (similar to existing pool tests)
+        assert!(actual_capacity > 64 * 1024 * 1024);
+        assert!(actual_capacity <= max_capacity);
+
+        // Task 4: Validate RAID0 status reporting
+        let raid_info = pool.raid_info();
+        assert!(raid_info.is_some(), "RAID0 pool should have raid_info");
+
+        let raid_info = raid_info.unwrap();
+        assert_eq!(raid_info.level, "raid0", "RAID level should be 'raid0'");
+        assert_eq!(raid_info.state, "online", "RAID state should be 'online'");
+
+        println!(
+            "RAID0 status validation: level={}, state={}",
+            raid_info.level, raid_info.state
+        );
+
+        // Verify pool shows up in LVS iterator
+        assert_eq!(
+            Lvs::iter().filter(|lvs| lvs.name() == "raid0_pool").count(),
+            1
+        );
+
+        // Clean up: Destroy the pool (this should handle RAID cleanup automatically)
+        pool.destroy().await.unwrap();
+
+        // Verify pool is gone
+        assert_eq!(
+            Lvs::iter().filter(|lvs| lvs.name() == "raid0_pool").count(),
+            0
+        );
+
+        println!("=== RAID0 Pool Creation/Destruction Test - Completed ===");
+    })
+    .await;
+
+    // RAID0 Pool Volume Operations Test
+    ms.spawn(async {
+        println!("=== RAID0 Pool Volume Operations Test - Starting ===");
+
+        // Create RAID0 pool for volume testing
+        let pool_args = PoolArgs {
+            name: "raid0_vol_pool".into(),
+            disks: vec![
+                "malloc:///raid0_vol_malloc0?size_mb=64".to_string(),
+                "malloc:///raid0_vol_malloc1?size_mb=64".to_string(),
+            ],
+            uuid: None,
+            cluster_size: None,
+            md_args: None,
+            backend: PoolBackend::Lvs,
+            enc_key: None,
+            crypto_vbdev_name: None,
+            raid_config: Some(RaidConfig::Raid0(Raid0Config::default())),
+        };
+
+        let pool = Lvs::create_or_import(pool_args).await.unwrap();
+
+        // Create volumes on RAID0 pool
+        let volume_size = 16 * 1024 * 1024; // 16MB volume
+        let volume1 = pool
+            .create_lvol("raid0_vol_1", volume_size, None, true, None)
+            .await
+            .unwrap();
+
+        let volume2 = pool
+            .create_lvol("raid0_vol_2", volume_size, None, true, None)
+            .await
+            .unwrap();
+
+        // Verify volumes work correctly
+        assert_eq!(pool.lvols().unwrap().count(), 2);
+        assert_eq!(volume1.name(), "raid0_vol_1");
+        assert_eq!(volume2.name(), "raid0_vol_2");
+        assert_eq!(volume1.size(), volume_size);
+
+        // Destroy volumes
+        volume1.destroy().await.unwrap();
+        volume2.destroy().await.unwrap();
+        assert_eq!(pool.lvols().unwrap().count(), 0);
+
+        // Clean up pool
+        pool.destroy().await.unwrap();
+
+        println!("=== RAID0 Pool Volume Operations Test - Completed ===");
+    })
+    .await;
+
+    // RAID0 Pool Export/Import Persistence Test
+    ms.spawn(async {
+        println!("=== RAID0 Pool Export/Import Test - Starting ===");
+
+        let strip_size_kb = 64;
+        let pool_args = PoolArgs {
+            name: "raid0_persist_pool".into(),
+            disks: vec![
+                format!("aio://{}", RAID0_DISK1),
+                format!("aio://{}", RAID0_DISK2),
+            ],
+            uuid: None,
+            cluster_size: None,
+            md_args: None,
+            backend: PoolBackend::Lvs,
+            enc_key: None,
+            crypto_vbdev_name: None,
+            raid_config: Some(RaidConfig::Raid0(Raid0Config { strip_size_kb })),
+        };
+
+        // Create RAID0 pool and volume
+        let pool = Lvs::create_or_import(pool_args.clone()).await.unwrap();
+        let original_uuid = pool.uuid();
+        let original_capacity = pool.capacity();
+
+        let volume = pool
+            .create_lvol("persist_vol", 16 * 1024 * 1024, None, true, None)
+            .await
+            .unwrap();
+
+        // Verify volume before export
+        assert_eq!(volume.name(), "persist_vol");
+        assert_eq!(volume.size(), 16 * 1024 * 1024);
+        assert_eq!(pool.lvols().unwrap().count(), 1);
+
+        // Export the pool
+        pool.export().await.unwrap();
+
+        // Import the pool back
+        let reimported_pool = Lvs::create_or_import(pool_args).await.unwrap();
+
+        // Verify RAID0 configuration persisted
+        assert_eq!(reimported_pool.name(), "raid0_persist_pool");
+        assert_eq!(reimported_pool.uuid(), original_uuid);
+        assert_eq!(reimported_pool.capacity(), original_capacity);
+
+        // Verify volume persisted
+        assert_eq!(reimported_pool.lvols().unwrap().count(), 1);
+        let persisted_volume = reimported_pool.lvols().unwrap().next().unwrap();
+        assert_eq!(persisted_volume.name(), "persist_vol");
+        assert_eq!(persisted_volume.size(), 16 * 1024 * 1024);
+
+        // Clean up
+        persisted_volume.destroy().await.unwrap();
+        reimported_pool.destroy().await.unwrap();
+
+        println!("=== RAID0 Pool Export/Import Test - Completed ===");
+    })
+    .await;
+
+    // RAID0 Pool I/O Data Integrity Test
+    ms.spawn(async {
+        println!("=== RAID0 Pool I/O Data Integrity Test - Starting ===");
+
+        let pool_args = PoolArgs {
+            name: "raid0_io_pool".into(),
+            disks: vec![
+                "malloc:///raid0_io_malloc0?size_mb=64".to_string(),
+                "malloc:///raid0_io_malloc1?size_mb=64".to_string(),
+            ],
+            uuid: None,
+            cluster_size: None,
+            md_args: None,
+            backend: PoolBackend::Lvs,
+            enc_key: None,
+            crypto_vbdev_name: None,
+            raid_config: Some(RaidConfig::Raid0(Raid0Config::default())),
+        };
+
+        // Create RAID0 pool and volume for I/O testing
+        let pool = Lvs::create_or_import(pool_args).await.unwrap();
+        let volume = pool
+            .create_lvol("io_test_vol", 32 * 1024 * 1024, None, true, None)
+            .await
+            .unwrap();
+
+        // Get bdev handle for I/O operations (following existing patterns)
+        let bdev = volume.as_bdev();
+        let handle = UntypedBdev::open_by_name(bdev.name(), true).unwrap();
+        let io_handle = handle.into_handle().unwrap();
+
+        // Test 1: Write data spanning multiple strips (2x strip size = 128KB)
+        let strip_size = 64 * 1024; // 64KB default strip size
+        let write_size = 2 * strip_size; // 128KB spans both devices
+        let mut write_buf = io_handle.dma_malloc(write_size).unwrap();
+
+        // Create distinctive striped pattern
+        for (i, byte) in write_buf.as_mut_slice().iter_mut().enumerate() {
+            *byte = (i % 256) as u8;
+        }
+
+        // Write to volume (tests RAID0 striping)
+        io_handle.write_at(0, &write_buf).await.unwrap();
+
+        // Test 2: Read back and verify data integrity
+        let mut read_buf = io_handle.dma_malloc(write_size).unwrap();
+        io_handle.read_at(0, &mut read_buf).await.unwrap();
+
+        // Verify striped data is intact
+        let read_slice = read_buf.as_slice();
+        for (i, &byte) in read_slice.iter().enumerate() {
+            let expected = (i % 256) as u8;
+            assert_eq!(
+                byte, expected,
+                "Data corruption at offset {i} in RAID0 striped volume"
+            );
+        }
+
+        println!("RAID0 I/O integrity test passed: {write_size} bytes written/read correctly");
+
+        // Test 3: Multiple I/O operations at different offsets
+        let test_offsets = [0, strip_size, write_size, write_size + strip_size / 2];
+        let small_size = 4096;
+
+        for &offset in &test_offsets {
+            let mut test_buf = io_handle.dma_malloc(small_size).unwrap();
+            test_buf.fill((offset / 1024) as u8); // Different pattern per offset
+
+            io_handle.write_at(offset, &test_buf).await.unwrap();
+
+            let mut verify_buf = io_handle.dma_malloc(small_size).unwrap();
+            io_handle.read_at(offset, &mut verify_buf).await.unwrap();
+
+            for &byte in verify_buf.as_slice() {
+                assert_eq!(byte, (offset / 1024) as u8);
+            }
+        }
+
+        println!("Multiple offset I/O test passed");
+
+        // Clean up (following Task 1 patterns)
+        drop(io_handle);
+        volume.destroy().await.unwrap();
+        pool.destroy().await.unwrap();
+
+        println!("=== RAID0 Pool I/O Data Integrity Test - Completed ===");
     })
     .await;
 }
