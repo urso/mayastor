@@ -1,0 +1,50 @@
+name: Tag Release from Upstream
+
+on:
+  push:
+    branches:
+      - 'release/*'
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to sync tags from (default: current branch)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  tag-release:
+    name: Sync Release Tags
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+          token: ${{ secrets.GIT_TOKEN }}
+
+      - name: Fetch target branch
+        if: inputs.branch != ''
+        run: git fetch origin ${{ inputs.branch }}
+
+      - name: Sync release tags
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          CMD="./scripts/xata/sync-release-tags.sh"
+          if [ -n "${{ inputs.branch }}" ]; then
+            CMD="$CMD --branch origin/${{ inputs.branch }}"
+          fi
+
+          set +e
+          $CMD
+          EXIT_CODE=$?
+          set -e
+
+          if [ ${EXIT_CODE} -ne 0 ] && [ ${EXIT_CODE} -ne 2 ]; then
+            exit ${EXIT_CODE}
+          fi

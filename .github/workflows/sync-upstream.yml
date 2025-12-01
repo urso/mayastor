@@ -61,6 +61,10 @@ jobs:
         if: steps.check-pr.outputs.found == 'false'
         run: git checkout -b "${{ steps.sync-branch.outputs.name }}"
 
+      - name: Configure git merge driver for .gitattributes
+        if: steps.check-pr.outputs.found == 'false'
+        run: git config --global merge.ours.driver true
+
       - name: Run upstream sync
         if: steps.check-pr.outputs.found == 'false'
         id: sync
