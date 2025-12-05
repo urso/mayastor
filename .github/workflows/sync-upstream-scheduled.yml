@@ -10,6 +10,71 @@ permissions:
   contents: read
 
 jobs:
+  discover-new-releases:
+    name: Discover New Release Branches
+    runs-on: ubuntu-latest
+    outputs:
+      new_releases: ${{ steps.find-new-releases.outputs.new_releases }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find new upstream release branches
+        id: find-new-releases
+        run: |
+          # Add upstream remote
+          git remote add upstream https://github.com/openebs/mayastor.git || true
+          git fetch upstream
+          git fetch origin
+
+          # Get upstream release branches
+          upstream_releases=$(git branch -r | grep 'upstream/release/' | sed 's|upstream/||' | sed 's|^[[:space:]]*||')
+
+          # Get our release branches
+          our_releases=$(git branch -r | grep 'origin/release/' | sed 's|origin/||' | sed 's|^[[:space:]]*||')
+
+          # Find releases in upstream that we don't have
+          new_releases=()
+          for branch in $upstream_releases; do
+            if ! echo "$our_releases" | grep -qx "$branch"; then
+              echo "🆕 New upstream release branch: $branch"
+              new_releases+=("$branch")
+            fi
+          done
+
+          # Convert to JSON array
+          if [ ${#new_releases[@]} -eq 0 ]; then
+            echo "No new release branches found"
+            echo "new_releases=[]" >> $GITHUB_OUTPUT
+          else
+            json_releases=$(printf '%s\n' "${new_releases[@]}" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "new_releases=${json_releases}" >> $GITHUB_OUTPUT
+          fi
+
+  create-release-branches:
+    name: Create ${{ matrix.branch }}
+    runs-on: ubuntu-latest
+    needs: discover-new-releases
+    if: needs.discover-new-releases.outputs.new_releases != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        branch: ${{ fromJson(needs.discover-new-releases.outputs.new_releases) }}
+    steps:
+      - name: Trigger create release branch workflow
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          gh workflow run create-release-branch.yml \
+            --repo "${{ github.repository }}" \
+            --ref develop \
+            -f release_branch="${{ matrix.branch }}" \
+            -f base_branch="develop"
+
+          echo "✅ Triggered create-release-branch for: ${{ matrix.branch }}"
+
   discover-branches:
     name: Discover Branches
     runs-on: ubuntu-latest

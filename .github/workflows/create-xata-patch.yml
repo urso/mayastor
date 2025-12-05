@@ -1,0 +1,60 @@
+name: Create Xata Patch Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Release branch (e.g., release/2.10) - leave empty for current branch'
+        required: false
+        type: string
+        default: ''
+      base_version:
+        description: 'Base version (e.g., v2.9.4) - leave empty to auto-detect'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Dry run (preview without creating tag)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-patch:
+    name: Create Xata Patch Tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+          token: ${{ secrets.GIT_TOKEN }}
+
+      - name: Fetch target branch
+        if: inputs.branch != ''
+        run: git fetch origin ${{ inputs.branch }}
+
+      - name: Create xata patch tag
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          CMD="./scripts/xata/create-xata-patch.sh"
+
+          if [ -n "${{ inputs.branch }}" ]; then
+            CMD="$CMD --branch origin/${{ inputs.branch }}"
+          fi
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            CMD="$CMD --dry-run"
+          fi
+
+          if [ -n "${{ inputs.base_version }}" ]; then
+            CMD="$CMD --base ${{ inputs.base_version }}"
+          fi
+
+          echo "Running: $CMD"
+          $CMD

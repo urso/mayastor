@@ -1,0 +1,93 @@
+name: Create Release Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_branch:
+        description: 'Upstream release branch (e.g., release/2.10)'
+        required: true
+        type: string
+      base_branch:
+        description: 'Base branch to search for merges (default: develop)'
+        required: false
+        type: string
+        default: 'develop'
+      target_branch:
+        description: 'Target branch name (default: same as release branch)'
+        required: false
+        type: string
+        default: ''
+      force:
+        description: 'Force (skip safety checks, recreate if exists)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  create-release-branch:
+    name: Create Release Branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+          token: ${{ secrets.GIT_TOKEN }}
+
+      - name: Determine target branch
+        id: target
+        run: |
+          TARGET_BRANCH="${{ inputs.target_branch }}"
+          if [ -z "$TARGET_BRANCH" ]; then
+            TARGET_BRANCH="${{ inputs.release_branch }}"
+          fi
+          echo "branch=${TARGET_BRANCH}" >> $GITHUB_OUTPUT
+
+      - name: Configure git merge driver for .gitattributes
+        run: git config --global merge.ours.driver true
+
+      - name: Create release branch
+        env:
+          GIT_AUTHOR_NAME: 'Xata Bot'
+          GIT_AUTHOR_EMAIL: 'xata-bot@users.noreply.github.com'
+          GIT_COMMITTER_NAME: 'Xata Bot'
+          GIT_COMMITTER_EMAIL: 'xata-bot@users.noreply.github.com'
+        run: |
+          CMD="./scripts/xata/create-release-branch.sh ${{ inputs.release_branch }}"
+
+          CMD="$CMD --base-branch ${{ inputs.base_branch }}"
+
+          if [ -n "${{ inputs.target_branch }}" ]; then
+            CMD="$CMD --target-branch ${{ inputs.target_branch }}"
+          fi
+
+          if [ "${{ inputs.force }}" = "true" ]; then
+            CMD="$CMD --force"
+          fi
+
+          echo "Running: $CMD"
+          $CMD
+
+      - name: Push release branch
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          echo "Pushing branch: ${{ steps.target.outputs.branch }}"
+          git push -u origin "${{ steps.target.outputs.branch }}" --no-follow-tags
+
+      - name: Sync release tags
+        env:
+          GH_TOKEN: ${{ secrets.GIT_TOKEN }}
+        run: |
+          set +e
+          ./scripts/xata/sync-release-tags.sh --branch "${{ steps.target.outputs.branch }}"
+          EXIT_CODE=$?
+          set -e
+
+          if [ ${EXIT_CODE} -ne 0 ] && [ ${EXIT_CODE} -ne 2 ]; then
+            exit ${EXIT_CODE}
+          fi
