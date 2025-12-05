@@ -122,7 +122,7 @@ jobs:
       BUILD_RESULT: ${{ needs.create-multi-platform-image.result == 'success' && 'success' || 'failure' }}
       SLACK_CHANNEL: "C08SN6AK8Q4" # p-storage
       TAG: ${{ needs.build-amd64.outputs.base_tag || github.ref_name }}
-      REGISTRY: ${{ needs.build-amd64.outputs.registry || format('{0}.dkr.ecr.{1}.amazonaws.com', env.AWS_ACCOUNT_ID, env.AWS_REGION) }}
+      REGISTRY: ${{ needs.build-amd64.outputs.registry || '390402546598.dkr.ecr.us-east-1.amazonaws.com' }}
       WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Post to Slack
