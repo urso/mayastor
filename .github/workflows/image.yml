@@ -117,59 +117,9 @@ jobs:
     name: Notify Slack
     needs: [build-amd64, build-arm64, create-multi-platform-image]
     if: always()
-    runs-on: ubuntu-latest
-    env:
-      BUILD_RESULT: ${{ needs.create-multi-platform-image.result == 'success' && 'success' || 'failure' }}
-      SLACK_CHANNEL: "C08SN6AK8Q4" # p-storage
-      TAG: ${{ needs.build-amd64.outputs.base_tag || github.ref_name }}
-      REGISTRY: ${{ needs.build-amd64.outputs.registry || '390402546598.dkr.ecr.us-east-1.amazonaws.com' }}
-      WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-    steps:
-      - name: Post to Slack
-        uses: slackapi/slack-github-action@v2
-        env:
-          STATUS_EMOJI: ${{ env.BUILD_RESULT == 'success' && '✅' || '❌' }}
-          STATUS_TEXT: ${{ env.BUILD_RESULT == 'success' && 'built and pushed' || 'build failed' }}
-        with:
-          method: chat.postMessage
-          token: ${{ secrets.SLACK_BOT_TOKEN }}
-          payload: |
-            {
-              "channel": "${{ env.SLACK_CHANNEL }}",
-              "text": "${{ env.STATUS_EMOJI }} mayastor images ${{ env.STATUS_TEXT }}: ${{ env.TAG }}",
-              "blocks": [
-                {
-                  "type": "section",
-                  "text": {
-                    "type": "mrkdwn",
-                    "text": "${{ env.STATUS_EMOJI }} *mayastor* images ${{ env.STATUS_TEXT }}"
-                  }
-                },
-                {
-                  "type": "section",
-                  "fields": [
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Tag*\n`${{ env.TAG }}`"
-                    },
-                    {
-                      "type": "mrkdwn",
-                      "text": "*Registry*\n`${{ env.REGISTRY }}`"
-                    }
-                  ]
-                },
-                {
-                  "type": "actions",
-                  "elements": [
-                    {
-                      "type": "button",
-                      "text": {
-                        "type": "plain_text",
-                        "text": "🔗 Workflow Run"
-                      },
-                      "url": "${{ env.WORKFLOW_URL }}"
-                    }
-                  ]
-                }
-              ]
-            }
+    uses: ./.github/workflows/notify.yaml
+    secrets: inherit
+    with:
+      result: ${{ needs.create-multi-platform-image.result == 'success' && 'success' || 'failure' }}
+      tag: ${{ needs.build-amd64.outputs.base_tag || github.ref_name }}
+      registry: ${{ needs.build-amd64.outputs.registry || '390402546598.dkr.ecr.us-east-1.amazonaws.com' }}

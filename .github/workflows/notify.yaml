@@ -1,0 +1,70 @@
+name: Notify Slack
+
+on:
+  workflow_call:
+    inputs:
+      result:
+        required: true
+        type: string
+        description: "Build result: 'success' or 'failure'"
+      tag:
+        required: true
+        type: string
+        description: "Image tag"
+      registry:
+        required: false
+        type: string
+        default: "390402546598.dkr.ecr.us-east-1.amazonaws.com"
+        description: "Container registry"
+      channel:
+        required: false
+        type: string
+        default: "C08SN6AK8Q4"
+        description: "Slack channel ID (default: p-storage)"
+  workflow_dispatch:
+    inputs:
+      result:
+        required: true
+        type: choice
+        options:
+          - success
+          - failure
+        description: "Build result"
+      tag:
+        required: true
+        type: string
+        description: "Image tag"
+      registry:
+        required: false
+        type: string
+        default: "390402546598.dkr.ecr.us-east-1.amazonaws.com"
+        description: "Container registry"
+      channel:
+        required: false
+        type: string
+        default: "C08SN6AK8Q4"
+        description: "Slack channel ID (default: p-storage)"
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Post to Slack
+        uses: slackapi/slack-github-action@v2
+        env:
+          SLACK_CHANNEL: ${{ inputs.channel }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ inputs.tag }}
+          REGISTRY: ${{ inputs.registry }}
+          WORKFLOW_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          STATUS_EMOJI: ${{ inputs.result == 'success' && '✅' || '❌' }}
+          STATUS_TEXT: ${{ inputs.result == 'success' && 'built and pushed' || 'build failed' }}
+        with:
+          method: chat.postMessage
+          token: ${{ secrets.SLACK_BOT_TOKEN }}
+          payload-file-path: .github/slack/image.json
+          payload-templated: true
+          errors: true

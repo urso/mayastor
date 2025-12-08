@@ -1,0 +1,39 @@
+{
+  "channel": "${{ env.SLACK_CHANNEL }}",
+  "text": "${{ env.STATUS_EMOJI }} ${{ env.REPOSITORY }} images ${{ env.STATUS_TEXT }}: ${{ env.TAG }}",
+  "blocks": [
+    {
+      "type": "section",
+      "text": {
+        "type": "mrkdwn",
+        "text": "${{ env.STATUS_EMOJI }} *${{ env.REPOSITORY }}* images ${{ env.STATUS_TEXT }}"
+      }
+    },
+    {
+      "type": "section",
+      "fields": [
+        {
+          "type": "mrkdwn",
+          "text": "*Tag*\n`${{ env.TAG }}`"
+        },
+        {
+          "type": "mrkdwn",
+          "text": "*Registry*\n`${{ env.REGISTRY }}`"
+        }
+      ]
+    },
+    {
+      "type": "actions",
+      "elements": [
+        {
+          "type": "button",
+          "text": {
+            "type": "plain_text",
+            "text": "Workflow Run"
+          },
+          "url": "${{ env.WORKFLOW_URL }}"
+        }
+      ]
+    }
+  ]
+}
