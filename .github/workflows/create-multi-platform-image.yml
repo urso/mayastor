@@ -51,7 +51,7 @@ jobs:
       - name: Create and push multi-platform manifests
         env:
           REGISTRY: ${{ env.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com
-          BASE_TAG: ${{ steps.determine-tag.outputs.base_tag }}
+          BASE_TAG: ${{ inputs.base_tag }}  # Optional: script will auto-detect from git if not provided
           ARCHITECTURES: ${{ env.ARCHITECTURES }}
           IMAGES: ${{ env.IMAGES }}
         run: ./scripts/xata/create-manifest.sh
