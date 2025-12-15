@@ -5,6 +5,17 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+\+xata[0-9]+'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to checkout and build (e.g. v2.10.0+xata1). Leave empty to auto-detect.'
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        description: 'Git tag to checkout and build (e.g. v2.10.0+xata1)'
+        required: false
+        type: string
 # Future triggers (disabled for now):
 #  push:
 #    branches:
@@ -38,6 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || '' }}
           submodules: 'recursive'
           fetch-depth: 0
           token: ${{ secrets.GIT_TOKEN }}
@@ -64,6 +76,7 @@ jobs:
         id: build
         env:
           ARCH: amd64
+          BASE_TAG: ${{ inputs.tag }}
         run: ./scripts/xata/build-and-push-ecr.sh
 
   build-arm64:
@@ -77,6 +90,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || '' }}
           submodules: 'recursive'
           fetch-depth: 0
           token: ${{ secrets.GIT_TOKEN }}
@@ -103,6 +117,7 @@ jobs:
         id: build
         env:
           ARCH: arm64
+          BASE_TAG: ${{ inputs.tag }}
         run: ./scripts/xata/build-and-push-ecr.sh
 
   create-multi-platform-image:
