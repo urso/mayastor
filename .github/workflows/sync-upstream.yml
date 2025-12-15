@@ -126,13 +126,13 @@ jobs:
           fi
 
       - name: Push sync branch
-        if: (steps.sync.outputs.exit_code == '0' || steps.sync.outputs.exit_code == '1') || steps.update-submodules.outputs.has_changes == 'true'
+        if: steps.check-pr.outputs.found == 'false' && ((steps.sync.outputs.exit_code == '0' || steps.sync.outputs.exit_code == '1') || steps.update-submodules.outputs.has_changes == 'true')
         env:
           GH_TOKEN: ${{ secrets.GIT_TOKEN }}
         run: git push -u origin "${{ steps.sync-branch.outputs.name }}"
 
       - name: Create pull request
-        if: (steps.sync.outputs.exit_code == '0' || steps.sync.outputs.exit_code == '1') || steps.update-submodules.outputs.has_changes == 'true'
+        if: steps.check-pr.outputs.found == 'false' && ((steps.sync.outputs.exit_code == '0' || steps.sync.outputs.exit_code == '1') || steps.update-submodules.outputs.has_changes == 'true')
         id: create-pr
         env:
           GH_TOKEN: ${{ secrets.GIT_TOKEN }}
