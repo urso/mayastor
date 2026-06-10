@@ -14,8 +14,10 @@ use crate::{
     bdev::{bdev_event_callback, nexus::NEXUS_MODULE_NAME},
     bdev_api::bdev_uri_eq,
     core::{
+        block_device::BlockDeviceIoErrorStats,
         share::{NvmfShareProps, Protocol, Share, UpdateProps},
         BlockDeviceIoStats, CoreError, DescriptorGuard, PtplProps, ShareNvmf, UnshareNvmf,
+        UnshareProps,
     },
     subsys::NvmfSubsystem,
     target::nvmf,
@@ -112,11 +114,10 @@ where
 
     /// Looks up a Bdev by its uuid.
     pub fn lookup_by_uuid_str(uuid: &str) -> Option<Self> {
+        let uuid = uuid::Uuid::parse_str(uuid).ok()?;
         match Self::bdev_first() {
             None => None,
-            Some(bdev) => bdev
-                .into_iter()
-                .find(|b| b.uuid_as_string() == uuid.to_lowercase()),
+            Some(bdev) => bdev.into_iter().find(|b| b.uuid() == uuid),
         }
     }
 
@@ -139,7 +140,7 @@ where
 
     /// Returns IoStats for a particular bdev.
     pub async fn stats_async(&self) -> Result<BlockDeviceIoStats, CoreError> {
-        match self.inner.stats_async().await {
+        match self.inner.stats_async(false).await {
             Ok(stat) => Ok(BlockDeviceIoStats {
                 num_read_ops: stat.num_read_ops,
                 num_write_ops: stat.num_write_ops,
@@ -162,12 +163,37 @@ where
         }
     }
 
+    /// Returns Io Error Stats for a particular bdev.
+    pub async fn stats_errors_async(&self) -> Result<BlockDeviceIoErrorStats, CoreError> {
+        match self.inner.stats_async(true).await {
+            Ok(mut stat) => Ok(stat.take_error_stats().expect("error is set")),
+            Err(err) => Err(CoreError::DeviceStatisticsFailed { source: err }),
+        }
+    }
+
     /// Resets io stats for a given Bdev.
     pub async fn reset_bdev_io_stats(&self) -> Result<(), CoreError> {
-        self.inner
-            .stats_reset_async()
+        self.reset_stats_ext(spdk_rs::BdevStatsResetMode::All)
             .await
             .map_err(|err| CoreError::DeviceStatisticsFailed { source: err })
+    }
+
+    /// Resets bdev stats with the specified reset mode.
+    pub async fn reset_stats_ext(
+        &self,
+        reset_mode: spdk_rs::BdevStatsResetMode,
+    ) -> Result<(), Errno> {
+        self.inner.stats_reset_async(reset_mode).await
+    }
+}
+
+/// Returns the share protocol if the bdev is currently shared.
+pub fn is_shared<T: spdk_rs::BdevOps>(bdev: &Bdev<T>) -> Option<Protocol> {
+    // TODO: we could do better here
+    match bdev.shared() {
+        Some(Protocol::Nvmf) => Some(Protocol::Nvmf),
+        _else if NvmfSubsystem::nqn_lookup(bdev.name()).is_some() => Some(Protocol::Nvmf),
+        _else => _else,
     }
 }
 
@@ -190,8 +216,7 @@ where
 
         let ptpl = props.ptpl().as_ref().map(|ptpl| ptpl.path());
 
-        // todo: add option to use uuid here, will allow for the replica uuid to
-        // be used!
+        // todo: add option to use uuid here, will allow for the replica uuid to be used!
         let subsystem = NvmfSubsystem::try_from_with(me, ptpl).context(ShareNvmf {})?;
 
         if let Some((cntlid_min, cntlid_max)) = props.cntlid_range() {
@@ -237,8 +262,8 @@ where
     }
 
     /// unshare the bdev regardless of current active share
-    async fn unshare(self: Pin<&mut Self>) -> Result<(), Self::Error> {
-        match self.shared() {
+    async fn unshare(self: Pin<&mut Self>, _opts: Option<UnshareProps>) -> Result<(), Self::Error> {
+        match is_shared(self.deref()) {
             Some(Protocol::Nvmf) => {
                 if let Some(ss) = NvmfSubsystem::nqn_lookup(self.name()) {
                     ss.stop().await.context(UnshareNvmf {})?;
@@ -390,8 +415,30 @@ pub trait BdevStater {
     /// Returns IoStats for a particular bdev.
     async fn stats(&self) -> Result<Self::Stats, CoreError>;
 
+    /// Returns error IoStats for a particular bdev.
+    async fn error_stats(&self) -> Result<BdevErrorStats, CoreError> {
+        Err(CoreError::DeviceStatisticsFailed {
+            source: Errno::EOPNOTSUPP,
+        })
+    }
+
     /// Resets io stats for a given Bdev.
     async fn reset_stats(&self) -> Result<(), CoreError>;
+}
+
+pub struct BdevErrorStats(pub BlockDeviceIoErrorStats);
+
+impl BdevErrorStats {
+    /// All errors except `spdk_rs::libspdk::SPDK_BDEV_IO_STATUS_NOMEM`.
+    pub fn error_count(&self) -> u64 {
+        self.0
+            .error_status
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i as i32 != -spdk_rs::libspdk::SPDK_BDEV_IO_STATUS_NOMEM - 1)
+            .map(|(_, v)| v)
+            .sum::<u32>() as u64
+    }
 }
 
 /// Bdev IO stats along with its name and uuid.

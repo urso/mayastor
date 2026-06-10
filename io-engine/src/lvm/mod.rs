@@ -26,6 +26,8 @@
 
 /// Helps run LVM commands and decode their json output and reports.
 mod cli;
+/// Device Mapper setup and info.
+pub mod dm_setup;
 mod error;
 /// Logical Volume management.
 mod lv_replica;
@@ -40,7 +42,7 @@ pub(crate) use error::Error;
 pub(crate) use cli::CmnQueryArgs;
 
 /// A pool which is a Volume Group in LVM.
-pub(crate) use vg_pool::VolumeGroup;
+pub use vg_pool::VolumeGroup;
 
 /// Logical volume and its query arguments.
 pub(crate) use lv_replica::{LogicalVolume, QueryArgs};
@@ -49,7 +51,8 @@ use crate::{
     bdev::PtplFileOps,
     core::{
         snapshot::SnapshotDescriptor, BdevStater, BdevStats, CloneParams, CoreError,
-        NvmfShareProps, Protocol, PtplProps, SnapshotParams, UntypedBdev, UpdateProps,
+        NvmfShareProps, Protocol, PtplProps, SnapshotParams, UnshareProps, UntypedBdev,
+        UpdateProps,
     },
     lvm::property::Property,
     pool_backend::{
@@ -115,16 +118,7 @@ impl PoolOps for VolumeGroup {
         &self,
         args: ReplicaArgs,
     ) -> Result<Box<dyn ReplicaOps>, crate::pool_backend::Error> {
-        let replica = LogicalVolume::create(
-            self.uuid(),
-            &args.name,
-            args.size,
-            &args.uuid,
-            args.thin,
-            &args.entity_id,
-            Protocol::Off,
-        )
-        .await?;
+        let replica = self.create_lvol(args).await?;
         Ok(Box::new(replica))
     }
 
@@ -139,6 +133,10 @@ impl PoolOps for VolumeGroup {
     }
 
     async fn grow(&self) -> Result<(), crate::pool_backend::Error> {
+        Err(Error::GrowNotSup {}.into())
+    }
+
+    async fn reset_errors(&self) -> Result<(), crate::pool_backend::Error> {
         Err(Error::GrowNotSup {}.into())
     }
 }
@@ -168,8 +166,11 @@ impl ReplicaOps for LogicalVolume {
     ) -> Result<String, crate::pool_backend::Error> {
         self.share_nvmf(Some(props)).await.map_err(Into::into)
     }
-    async fn unshare(&mut self) -> Result<(), crate::pool_backend::Error> {
-        self.unshare().await.map_err(Into::into)
+    async fn unshare(
+        &mut self,
+        opts: Option<UnshareProps>,
+    ) -> Result<(), crate::pool_backend::Error> {
+        self.unshare(opts).await.map_err(Into::into)
     }
     async fn update_properties(
         &mut self,

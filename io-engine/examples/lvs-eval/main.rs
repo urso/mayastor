@@ -135,10 +135,7 @@ async fn create_lvs(args: &CliArgs) -> Lvs {
         md_args: Some(PoolMetadataArgs {
             max_expansion: args.max_expansion.clone(),
         }),
-        backend: Default::default(),
-        enc_key: None,
-        crypto_vbdev_name: None,
-        raid_config: None,
+        ..Default::default()
     };
 
     Lvs::create_or_import(lvs_args.clone()).await.unwrap()
@@ -179,6 +176,7 @@ async fn create_lvol(
         thin,
         entity_id: None,
         use_extent_table: Some(et),
+        wipe_super: true,
     };
 
     lvs.create_lvol_with_opts(opts).await.map_err(|err| {

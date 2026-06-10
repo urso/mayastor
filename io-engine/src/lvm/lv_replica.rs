@@ -2,9 +2,10 @@ use super::{cli::de, error::Error, vg_pool::VolumeGroup, CmnQueryArgs};
 use crate::{
     bdev::PtplFileOps,
     bdev_api::{bdev_create, BdevError},
-    core::{NvmfShareProps, Protocol, PtplProps, Share, UntypedBdev, UpdateProps},
+    core::{NvmfShareProps, Protocol, PtplProps, Share, UnshareProps, UntypedBdev, UpdateProps},
     lvm::{
         cli::LvmCmd,
+        dm_setup::{DmSetup, DmState, DmTable},
         property::{Property, PropertyType},
     },
     pool_backend::PoolBackend,
@@ -195,23 +196,48 @@ struct LogicalVolumeList {
 impl LogicalVolume {
     /// Create a new logical volume for the given vg uuid.
     pub(crate) async fn create(
-        vg_uuid: &str,
-        name: &str,
-        size: u64,
-        uuid: &str,
-        thin: bool,
-        entity_id: &Option<String>,
+        pool: &VolumeGroup,
+        args: crate::pool_backend::ReplicaArgs,
         share: Protocol,
+        spdk: bool,
     ) -> Result<LogicalVolume, Error> {
-        let pool = VolumeGroup::lookup(CmnQueryArgs::ours().uuid(vg_uuid)).await?;
-        pool.create_lvol(name, size, uuid, thin, entity_id, share)
-            .await?;
-        Self::lookup(
+        info!(
+            name = args.name,
+            uuid = args.uuid,
+            vg_name = pool.name(),
+            "Creating LVM Logical Volume"
+        );
+
+        let error = match pool.create_lvoli(&args, share, spdk).await {
+            Ok(_) => Ok(None),
+            Err(error @ Error::Exists { .. }) => Ok(Some(error)),
+            Err(error) => Err(error),
+        }?;
+        let lvol = Self::lookup(
             &QueryArgs::new()
-                .with_lv(CmnQueryArgs::ours().uuid(uuid))
-                .with_vg(CmnQueryArgs::ours().uuid(vg_uuid)),
+                .with_lv(CmnQueryArgs::ours_if(spdk).uuid(&args.uuid))
+                .with_vg(CmnQueryArgs::ours_if(spdk).uuid(pool.uuid())),
         )
-        .await
+        .await?;
+
+        let Some(error) = error else {
+            return Ok(lvol);
+        };
+
+        snafu::ensure!(lvol.name().as_deref() == Some(&args.name), error);
+        snafu::ensure!(lvol.uuid() == args.uuid, error);
+        snafu::ensure!(lvol.size() == args.size, error);
+        snafu::ensure!(lvol.entity_id() == args.entity_id.as_ref(), error);
+        snafu::ensure!(lvol.share_proto().unwrap_or_default() == share, error);
+
+        info!(
+            name = args.name,
+            uuid = args.uuid,
+            vg_name = pool.name(),
+            "LVM LogicalVolume imported successfully"
+        );
+
+        Ok(lvol)
     }
 
     /// Lookup a single logical volume.
@@ -242,6 +268,78 @@ impl LogicalVolume {
         }
         g_error?;
         Ok(lvs)
+    }
+
+    /// Suspends the [`LogicalVolume`].
+    ///
+    /// # NOTES
+    ///
+    /// See details from [`DmSetup::suspend`].
+    ///
+    /// # WARNING
+    ///
+    /// The device is only suspended once the open count reaches 0.
+    /// This means the device might not be suspended after the suspend call completes.
+    /// You should consider using awaiting till [`DmState`] is [`DmState::SUSPENDED`].
+    pub async fn dm_suspend(&mut self) -> Result<DmState, Error> {
+        DmSetup::suspend(&self.path).await?;
+        self.dm_state().await
+    }
+    /// Resumes/Un-suspends the [`LogicalVolume`].
+    ///
+    /// # NOTES
+    ///
+    /// See details from [`DmSetup::resume`].
+    pub async fn dm_resume(&mut self) -> Result<DmState, Error> {
+        DmSetup::resume(&self.path).await?;
+        self.dm_state().await
+    }
+
+    /// Retrieve the [`DmState`] of the [`LogicalVolume`].
+    pub async fn dm_state(&self) -> Result<DmState, Error> {
+        DmSetup::state(&self.path).await
+    }
+
+    /// Retrieve the device-mapper table for the [`LogicalVolume`].
+    pub async fn table(&self) -> Result<DmTable, Error> {
+        DmSetup::table(self.path()).await
+    }
+
+    /// A very simple way of making the [`LogicalVolume`] return -EIO for all I/O.
+    ///
+    /// Returns the previous device-mapper table for restoring.
+    pub async fn bork(&mut self) -> Result<DmTable, Error> {
+        let current = DmSetup::table(self.path()).await?;
+
+        let sz = self.sz().await?;
+        let table = format!("0 {sz} error");
+        DmSetup::load(self.path(), DmTable(table)).await?;
+        self.dm_resume().await.ok();
+        Ok(current)
+    }
+
+    async fn sz(&self) -> Result<u64, Error> {
+        let output = LvmCmd::blk_dev()
+            .arg("--getsz")
+            .arg(self.path())
+            .output()
+            .await?;
+        let output_str = String::from_utf8_lossy(&output.stdout).to_string();
+        let sz_str = output_str.trim_end();
+        sz_str.parse::<u64>().map_err(|error| Error::Internal {
+            error: error.to_string(),
+        })
+    }
+
+    /// Undoes a borked [`LogicalVolume`] by re-applying the previous device-mapper table.
+    pub async fn unbork(&mut self, table: DmTable) -> Result<DmState, Error> {
+        DmSetup::load(self.path(), table).await?;
+        self.dm_resume().await
+    }
+
+    /// Retrieve the device path of the [`LogicalVolume`].
+    pub fn path(&self) -> &str {
+        &self.path
     }
 
     /// Fetch logical volumes using the provided options as query criteria.
@@ -638,7 +736,7 @@ impl LogicalVolume {
         match bdev.shared() {
             Some(Protocol::Nvmf) => {
                 bdev.as_mut()
-                    .unshare()
+                    .unshare(None)
                     .await
                     .map_err(|source| Error::BdevUnshare { source })?;
             }
@@ -698,7 +796,7 @@ impl LogicalVolume {
     }
 
     /// Unshare the nvmf target.
-    pub(crate) async fn unshare(&mut self) -> Result<(), Error> {
+    pub(crate) async fn unshare(&mut self, opts: Option<UnshareProps>) -> Result<(), Error> {
         let (bdev, uri) = self.bdev_mut_uri()?;
         let share = crate::spdk_run!(async move {
             let mut bdev = Self::bdev(&uri)?;
@@ -707,7 +805,10 @@ impl LogicalVolume {
 
         bdev.share_uri = share;
         bdev.share = Protocol::Off;
-        self.sync_share_protocol(Protocol::Off).await?;
+
+        if opts.unwrap_or_default().persist {
+            self.sync_share_protocol(Protocol::Off).await?;
+        }
 
         info!("{self:?}: unshared");
         Ok(())
@@ -888,8 +989,11 @@ impl Share for LogicalVolume {
         self.as_mut().update_share_props(props).await
     }
 
-    async fn unshare(mut self: Pin<&mut Self>) -> Result<(), Self::Error> {
-        self.unshare().await
+    async fn unshare(
+        mut self: Pin<&mut Self>,
+        opts: Option<UnshareProps>,
+    ) -> Result<(), Self::Error> {
+        self.deref_mut().unshare(opts).await
     }
 
     fn shared(&self) -> Option<Protocol> {

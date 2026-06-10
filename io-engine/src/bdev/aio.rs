@@ -185,6 +185,12 @@ impl CreateDestroy for Aio {
     }
 }
 
+impl super::Probe for Aio {
+    fn probe(&self, _opts: &super::ProbeOpts) -> Result<(), super::ProbeError> {
+        super::probe_file(&self.name)
+    }
+}
+
 impl Aio {
     fn try_rescan(&self, bdev: UntypedBdev) -> Result<String, <Self as CreateDestroy>::Error> {
         let before = bdev.num_blocks();

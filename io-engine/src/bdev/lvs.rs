@@ -233,6 +233,7 @@ impl GetName for Lvol {
         self.name.clone()
     }
 }
+impl super::Probe for Lvol {}
 
 #[async_trait(?Send)]
 impl CreateDestroy for Lvol {
@@ -270,6 +271,7 @@ impl Lvs {
             // XXX: Is this path ever exercised apart from test, or casperf perhaps?
             crypto_vbdev_name: self.key.as_ref().map(|_| format!("crypto_{}", self.name)),
             raid_config: self.raid_config.clone(),
+            no_spdk: false,
         };
         match &self.mode {
             LvsMode::Create => match crate::lvs::Lvs::import_from_args(args.clone()).await {
@@ -365,10 +367,7 @@ impl Lvs {
                 name: self.name.to_owned(),
             });
         };
-        let Some(lvols) = lvs.lvols() else {
-            return Ok(());
-        };
-        let Some(lvol) = lvols.into_iter().find(|l| l.name() == name) else {
+        let Some(lvol) = lvs.lvols().find(|l| l.name() == name) else {
             return Ok(());
         };
         lvol.destroy()

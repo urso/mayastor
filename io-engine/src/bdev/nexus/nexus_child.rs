@@ -19,7 +19,7 @@ use crate::{
     bdev::{device_create, device_destroy, device_lookup},
     bdev_api::BdevError,
     core::{
-        BlockDevice, BlockDeviceDescriptor, BlockDeviceHandle, CoreError, DeviceEventSink,
+        BlockDevice, BlockDeviceDescriptor, BlockDeviceHandle, CoreError, DeviceEventSink, ToErrno,
         VerboseError,
     },
     eventing::replica_events::state_change_event_meta,
@@ -97,6 +97,33 @@ pub enum ChildError {
     ChildBdevCreate { child: String, source: BdevError },
 }
 
+impl ToErrno for ChildError {
+    fn to_errno(&self) -> Errno {
+        match self {
+            ChildError::PermanentlyFaulted { .. } => Errno::EFAULT,
+            ChildError::ChildFaulted { .. } => Errno::EFAULT,
+            ChildError::ChildBeingDestroyed { .. } => Errno::EBUSY,
+            ChildError::ChildTooSmall { .. } => Errno::EINVAL,
+            ChildError::ChildInaccessible { .. } => Errno::ENXIO,
+            ChildError::CannotOnlineChild { .. } => Errno::ERFKILL,
+            ChildError::ResvType { .. } => Errno::EINVAL,
+            ChildError::ResvNoHolder { .. } => Errno::EPERM,
+            ChildError::Holder { .. } => Errno::EPERM,
+            ChildError::ClaimChild { source } => *source,
+            ChildError::OpenChild { source } => source.to_errno(),
+            ChildError::HandleCreate { source } => source.to_errno(),
+            ChildError::HandleOpen { source } => source.to_errno(),
+            ChildError::HandleDmaMalloc { .. } => Errno::ENOMEM,
+            ChildError::ResvRegisterKey { source } => source.to_errno(),
+            ChildError::ResvAcquire { source } => source.to_errno(),
+            ChildError::ResvRelease { source } => source.to_errno(),
+            ChildError::ResvReport { source } => source.to_errno(),
+            ChildError::NvmeHostId { source } => source.to_errno(),
+            ChildError::ChildBdevCreate { source, .. } => source.to_errno(),
+        }
+    }
+}
+
 /// Fault reason.
 #[derive(Debug, Serialize, PartialEq, Deserialize, Eq, Copy, Clone)]
 pub enum FaultReason {
@@ -124,6 +151,10 @@ pub enum FaultReason {
     Offline,
     /// The child has been permanently offlined by a client API call.
     OfflinePermanent,
+    /// The child has been hot-removed.
+    /// This may be as a result of mistaken child deletion (ie xxx)
+    /// or as result of the backend pool itself getting hot-removed.
+    HotRemove,
 }
 
 impl Display for FaultReason {
@@ -138,6 +169,7 @@ impl Display for FaultReason {
             Self::AdminCommandFailed => write!(f, "admin command failed"),
             Self::Offline => write!(f, "offline"),
             Self::OfflinePermanent => write!(f, "offline permanent"),
+            Self::HotRemove => write!(f, "hot-remove"),
         }
     }
 }
@@ -153,6 +185,7 @@ impl FaultReason {
                 | Self::Offline
                 | Self::AdminCommandFailed
                 | Self::RebuildFailed
+                | Self::HotRemove
         )
     }
 }
@@ -277,7 +310,7 @@ pub struct NexusChild<'c> {
     faulted_at: parking_lot::Mutex<Option<DateTime<Utc>>>,
     /// TODO
     #[serde(skip_serializing)]
-    remove_channel: (async_channel::Sender<()>, async_channel::Receiver<()>),
+    remove_channel: (async_channel::Sender<bool>, async_channel::Receiver<bool>),
     /// Name of the child is the URI used to create it.
     /// Name of the underlying block device can differ from it.
     ///
@@ -496,6 +529,11 @@ impl<'c> NexusChild<'c> {
     #[inline]
     pub fn is_healthy(&self) -> bool {
         self.state() == ChildState::Open && self.sync_state() == ChildSyncState::Synced
+    }
+
+    /// Determines if the child is faulted.
+    pub fn is_faulted(&self) -> bool {
+        matches!(self.state(), ChildState::Faulted(..))
     }
 
     /// Determines if the child is being rebuilt.
@@ -922,10 +960,7 @@ impl<'c> NexusChild<'c> {
         let state = self.state.load();
 
         if state.is_open_or_init() {
-            warn!(
-                "{:?}: child is in {} state and cannot be onlined",
-                self, state
-            );
+            warn!("{self:?}: child is in {state} state and cannot be onlined");
             return Err(ChildError::CannotOnlineChild {});
         }
 
@@ -935,10 +970,7 @@ impl<'c> NexusChild<'c> {
         }
 
         if !state.is_recoverable() {
-            warn!(
-                "{:?}: child is permanently faulted and cannot be onlined",
-                self
-            );
+            warn!("{self:?}: child is permanently faulted and cannot be onlined",);
             return Err(ChildError::PermanentlyFaulted {});
         }
 
@@ -950,10 +982,7 @@ impl<'c> NexusChild<'c> {
 
         self.device = device_lookup(&name);
         if self.device.is_none() {
-            error!(
-                "{:?}: failed to find device after successful creation",
-                self,
-            );
+            error!("{self:?}: failed to find device after successful creation",);
             return Err(ChildError::ChildInaccessible {});
         }
 
@@ -1001,10 +1030,36 @@ impl<'c> NexusChild<'c> {
             Ok(_) => {
                 info!("{self:?}: block device destroyed, waiting for removal...");
 
-                // Only wait for block device removal if the child has been
-                // initialised.
+                // Only wait for block device removal if the child has been initialised.
                 if self.state.load() != ChildState::Init {
-                    self.remove_channel.1.recv().await.ok();
+                    // In case unplug happens before we close the child, it will not destroy the
+                    // block device.
+                    // Destroying the device *should* lead to another device removal event, which
+                    // will again trigger unplug. By leaving the destroy state in place, we ensure
+                    // the unplug will remove the block device this time.
+                    //
+                    // Update: in the snapshot tests, a nexus nvmf child faults, but is not removed
+                    // fully as the device gets recreated with manual device creation.
+                    // This leaves the device still linked to the nexus child but with no listener
+                    // events to trigger the unplug from the device destroy.
+                    // Whilst this is probably something that won't happen in prod, let's be a bit
+                    // conservative here, and give up after *sometime*.
+                    let mut tries = 0;
+                    let mut destroyed = self.remove_channel.1.recv().await.unwrap_or(true);
+                    while !destroyed && tries < 20 {
+                        if self.remove_channel.1.is_empty() {
+                            let tm = std::time::Duration::from_millis(tries);
+                            crate::sleep::mayastor_sleep(tm).await.ok();
+                            tries += 1;
+                            continue;
+                        }
+                        destroyed = self.remove_channel.1.recv().await.unwrap_or(true);
+                    }
+                    if !destroyed {
+                        tracing::warn!(
+                            "{self:?}: child closing but the block-device handles remained"
+                        );
+                    }
                 }
 
                 self.set_destroy_state(ChildDestroyState::None);
@@ -1017,6 +1072,18 @@ impl<'c> NexusChild<'c> {
                 Err(e)
             }
         }
+    }
+
+    /// At the moment it's not enterely straightforward to determine if a child bdev
+    /// has been hot-removed.
+    /// This can happen as a result of a lvol/bdev destruction whilst the child is still in
+    /// use or as a result of the pool's hot-removal due to backend errors
+    /// which will also hot-remove the lvol/bdev.
+    /// Here we try to determine "unintended" hot-removal by checking if the child was still
+    /// open and not already being destroyed.
+    pub(crate) fn hot_removed(&mut self) -> bool {
+        let state = self.state();
+        matches!(state, ChildState::Open) && !self.is_destroying()
     }
 
     /// Called in response to a device removal event.
@@ -1071,7 +1138,8 @@ impl<'c> NexusChild<'c> {
 
     /// Signal that the child unplug is complete.
     async fn unplug_complete(&self) {
-        if let Err(error) = self.remove_channel.0.send(()).await {
+        let destroyed = self.device_descriptor.is_none();
+        if let Err(error) = self.remove_channel.0.send(destroyed).await {
             info!("{self:?}: failed to send unplug complete: {error}");
         } else {
             info!("{self:?}: child successfully unplugged");
@@ -1094,7 +1162,7 @@ impl<'c> NexusChild<'c> {
             sync_state: AtomicCell::new(ChildSyncState::Synced),
             destroy_state: AtomicCell::new(ChildDestroyState::None),
             faulted_at: parking_lot::Mutex::new(None),
-            remove_channel: async_channel::bounded(1),
+            remove_channel: async_channel::bounded(2),
             io_log: Mutex::new(None),
             _c: Default::default(),
         }
@@ -1220,7 +1288,6 @@ impl<'c> NexusChild<'c> {
         if io_log.is_none() {
             if let Some(d) = &self.device {
                 *io_log = Some(IOLog::new(&d.device_name(), d.num_blocks(), d.block_len()));
-
                 debug!("{self:?}: started new I/O log: {log:?}", log = *io_log);
             }
         }

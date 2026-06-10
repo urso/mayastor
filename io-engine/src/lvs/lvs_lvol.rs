@@ -2,7 +2,6 @@ use async_trait::async_trait;
 use byte_unit::Byte;
 use events_api::event::EventAction;
 use futures::channel::oneshot;
-use nix::errno::Errno;
 use pin_utils::core_reexport::fmt::Formatter;
 
 use std::{
@@ -28,8 +27,8 @@ use crate::{
     bdev::PtplFileOps,
     core::{
         logical_volume::{LogicalVolume, LvolSpaceUsage},
-        Bdev, CloneXattrs, LvolSnapshotOps, NvmfShareProps, Protocol, PtplProps, Share,
-        SnapshotXattrs, UntypedBdev, UpdateProps,
+        Bdev, CloneXattrs, LvolSnapshotOps, NvmfShareProps, PropXattrs, Protocol, PtplProps, Share,
+        SnapshotXattrs, UnshareProps, UntypedBdev, UpdateProps,
     },
     eventing::Event,
     ffihelper::{
@@ -121,7 +120,6 @@ impl TryFrom<UntypedBdev> for Lvol {
             }
         } else {
             Err(LvsError::NotALvol {
-                source: BsError::InvalidArgument {},
                 name: b.name().to_string(),
             })
         }
@@ -206,16 +204,24 @@ impl Share for Lvol {
     }
 
     /// unshare the nvmf target
-    async fn unshare(mut self: Pin<&mut Self>) -> Result<(), Self::Error> {
+    async fn unshare(
+        mut self: Pin<&mut Self>,
+        opts: Option<UnshareProps>,
+    ) -> Result<(), Self::Error> {
+        let opts = opts.unwrap_or_default();
+        let persist = opts.persist;
+
         Pin::new(&mut self.as_bdev())
-            .unshare()
+            .unshare(Some(opts))
             .await
             .map_err(|e| LvsError::LvolUnShare {
                 source: e,
                 name: self.name(),
             })?;
 
-        self.as_mut().set(PropValue::Shared(false)).await?;
+        if persist {
+            self.as_mut().set(PropValue::Shared(false)).await?;
+        }
 
         info!("{:?}: unshared", self);
         Ok(())
@@ -265,6 +271,11 @@ impl Lvol {
         unsafe { self.inner.as_ref() }
     }
 
+    /// Is the provided Lvol pointing to the same `spdk_lvol` as us?
+    pub fn is_same(&self, b: &Self) -> bool {
+        self.inner.as_ptr() == b.inner.as_ptr()
+    }
+
     pub fn ok_from(mut bdev: UntypedBdev) -> Option<Self> {
         if !Self::is_lvol(&bdev) {
             return None;
@@ -282,30 +293,41 @@ impl Lvol {
         bdev.driver() == "lvol"
     }
 
+    /// Lookup an [`Lvol`] by its string uuid.
+    pub fn lookup_by_uuid_str(uuid: &str) -> Option<Self> {
+        let uuid = uuid::Uuid::parse_str(uuid).ok()?;
+        let uuid = crate::spdk_rs::Uuid::from(uuid);
+
+        // todo: add get_by_uuid for our lvs, we don't need to query all of them!
+        let lvol = unsafe { spdk_rs::libspdk::spdk_lvol_get_by_uuid(&uuid.into_raw()) };
+        if lvol.is_null() {
+            return None;
+        }
+        Some(Self::from_inner_ptr(lvol))
+    }
+
     /// Wipe the first 8MB if unmap is not supported on failure the operation
     /// needs to be repeated.
     pub async fn wipe_super(&self) -> Result<(), LvsError> {
         if self.as_inner_ref().clear_method != LVS_CLEAR_WITH_UNMAP {
             let hdl = Bdev::open(&self.as_bdev(), true)
                 .and_then(|desc| desc.into_handle())
-                .map_err(|e| {
-                    error!(?self, ?e, "failed to wipe lvol");
-                    LvsError::RepDestroy {
-                        source: BsError::from_errno(Errno::ENXIO),
+                .map_err(|error| {
+                    error!(?self, %error, "failed to open lvol for wipe");
+                    LvsError::WipeFailed {
+                        source: error,
                         name: self.name(),
-                        msg: "failed to wipe lvol".into(),
                     }
                 })?;
 
             // write zero to the first 8MB which wipes the metadata and the
             // first 4MB of the data partition
             let wipe_size = std::cmp::min(self.as_bdev().size_in_bytes(), WIPE_SUPER_LEN);
-            hdl.write_zeroes_at(0, wipe_size).await.map_err(|e| {
-                error!(?self, ?e);
-                LvsError::RepDestroy {
-                    source: BsError::from_errno(Errno::EIO),
+            hdl.write_zeroes_at(0, wipe_size).await.map_err(|error| {
+                error!(?self, %error, "Failed to wipe/write-zeroes");
+                LvsError::WipeFailed {
+                    source: error,
                     name: self.name(),
-                    msg: "failed to write to lvol".into(),
                 }
             })?;
         }
@@ -330,19 +352,22 @@ impl Lvol {
         LvolPtpl::from(self)
     }
 
-    /// Common API to get the xattr from blob.
-    pub fn get_blob_xattr(blob: *mut spdk_blob, attr: &str) -> Option<String> {
-        if blob.is_null() {
-            return None;
-        }
-        let blob_inner = blob;
+    /// Get the attribute value for the specified attribute name.
+    /// # Safety
+    /// You should use the safe [`Self::blob_xattr`] and [`Self::get_blob_xattr`] which ensure the
+    /// value doesn't live beyong the specified blob.
+    unsafe fn blob_xattr_<'a, I: Into<PropXattrs>>(
+        blob: *mut spdk_blob,
+        attr: I,
+    ) -> Option<&'a str> {
         let mut val: *const libc::c_char = std::ptr::null::<libc::c_char>();
         let mut size: u64 = 0;
-        let attribute = attr.into_cstring();
+        let attr: PropXattrs = attr.into();
+        let attribute = attr.name();
 
         unsafe {
             let r = spdk_blob_get_xattr_value(
-                blob_inner,
+                blob,
                 attribute.as_ptr(),
                 &mut val as *mut *const c_char as *mut *const c_void,
                 &mut size as *mut u64,
@@ -387,21 +412,36 @@ impl Lvol {
             std::str::from_utf8(sl).map_or_else(
                 |error| {
                     warn!(
-                        attribute = attr,
+                        ?attribute,
                         ?error,
                         "Failed to parse attribute, default to empty string"
                     );
                     None
                 },
-                |v| Some(v.to_string()),
+                Some,
             )
         }
     }
 
+    /// Get the given blob's attribute value for the specified attribute name.
+    /// The attribute value's lifecycle is tied to the blob.
+    pub fn get_blob_xattr<I: Into<PropXattrs>>(blob: &mut *mut spdk_blob, attr: I) -> Option<&str> {
+        if blob.is_null() {
+            return None;
+        }
+        unsafe { Self::blob_xattr_(*blob, attr) }
+    }
+
+    /// Get the attribute value for the specified attribute name.
+    /// The attribute value's lifecycle is tied to the lvol object.
+    pub fn blob_xattr<I: Into<PropXattrs>>(&self, attr: I) -> Option<&str> {
+        unsafe { Self::blob_xattr_(self.blob_checked(), attr) }
+    }
+
     /// Low-level function to set blob attributes.
-    pub async fn set_blob_attr<A: AsRef<str>>(
+    pub async fn set_blob_attr<I: Into<PropXattrs>>(
         &self,
-        attr: A,
+        attr: I,
         value: String,
         sync_metadata: bool,
     ) -> Result<(), LvsError> {
@@ -409,7 +449,8 @@ impl Lvol {
             done_cb(cb_arg, errno);
         }
 
-        let attr_name = attr.as_ref().into_cstring();
+        let attr: PropXattrs = attr.into();
+        let attr_name = attr.name();
         let attr_val = value.clone().into_cstring();
 
         let r = unsafe {
@@ -422,16 +463,17 @@ impl Lvol {
         };
 
         if r != 0 {
+            let attr = attr.name().to_string_lossy();
             error!(
                 lvol = self.name(),
-                attr = attr.as_ref(),
+                %attr,
                 value,
                 errno = r,
                 "Failed to set blob attribute"
             );
             return Err(LvsError::SetProperty {
                 source: BsError::from_i32(r),
-                prop: attr.as_ref().to_owned(),
+                prop: attr.to_string(),
                 name: self.name(),
             });
         }
@@ -458,6 +500,39 @@ impl Lvol {
                 })
             }
         }
+    }
+
+    /// Check if this snapshot has dependent clones.
+    pub fn has_clones(&self) -> bool {
+        self.clone_count() > 0
+    }
+
+    /// Count how many replica clones are dependent on this snapshot.
+    pub fn clone_count(&self) -> u64 {
+        let uuid = self.uuid().into_cstring();
+        unsafe {
+            spdk_rs::libspdk::spdk_blob_count_real_clones(
+                self.lvs().blob_store(),
+                CloneXattrs::SourceUuid.name().as_ptr() as *const c_char,
+                uuid.as_ptr() as *const c_char,
+            )
+        }
+    }
+
+    /// Count how many clones are dependent on this snapshot.
+    /// # Warning
+    /// These clones may be snapshots or "real_clones".
+    pub fn blob_clone_count(&self) -> u64 {
+        let mut count: u64 = 0;
+        unsafe {
+            spdk_rs::libspdk::spdk_blob_get_clones(
+                self.lvs().blob_store(),
+                self.as_inner_ref().blob_id,
+                std::ptr::null_mut(),
+                &mut count,
+            )
+        };
+        count
     }
 }
 
@@ -496,7 +571,9 @@ impl PtplFileOps for LvolPtpl {
 
     fn destroy(&self) -> Result<(), std::io::Error> {
         if let Some(path) = self.path() {
-            std::fs::remove_file(path)?;
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
         }
         Ok(())
     }
@@ -519,8 +596,9 @@ pub trait LvsLvol: LogicalVolume + Share {
     fn as_bdev(&self) -> UntypedBdev;
 
     /// Lvol is considered as clone if its sourceuuid attribute is a valid
-    /// snapshot. if it is clone, return the snapshot lvol.
-    fn is_snapshot_clone(&self) -> Option<Lvol>;
+    /// snapshot.
+    /// And if it is clone, return the snapshot Lvol.
+    fn clone_source(&self) -> Option<Lvol>;
 
     /// Get/Read a property of this lvol from the in-memory metadata copy.
     async fn get(&self, prop: PropName) -> Result<PropValue, LvsError>;
@@ -611,7 +689,7 @@ impl LogicalVolume for Lvol {
 
     /// Returns entity id of the Logical Volume.
     fn entity_id(&self) -> Option<String> {
-        Lvol::get_blob_xattr(self.blob_checked(), "entity_id")
+        self.blob_xattr(PropXattrs::BrokenEntityId).map(Into::into)
     }
 
     /// Returns a boolean indicating if the Logical Volume is thin provisioned.
@@ -655,6 +733,8 @@ impl LogicalVolume for Lvol {
             let num_allocated_clusters_snapshots = {
                 let mut c: u64 = 0;
 
+                // this approach is wholy inneficient as we have a large chain we are iterating
+                // the same blobs multiple times
                 match spdk_blob_get_num_clusters_ancestors(bs, blob, &mut c) {
                     0 => c,
                     errno => {
@@ -694,15 +774,12 @@ impl LogicalVolume for Lvol {
     /// Looks like a bug in SPDK, but all snapshot attribute are intact in
     /// SPDK after io-engine restarts.
     fn is_snapshot(&self) -> bool {
-        Lvol::get_blob_xattr(
-            self.blob_checked(),
-            SnapshotXattrs::SnapshotCreateTime.name(),
-        )
-        .is_some()
+        self.blob_xattr(SnapshotXattrs::SnapshotCreateTime)
+            .is_some()
     }
 
     fn is_clone(&self) -> bool {
-        self.is_snapshot_clone().is_some()
+        self.blob_xattr(CloneXattrs::SourceUuid).is_some()
     }
 
     fn backend(&self) -> PoolBackend {
@@ -710,7 +787,7 @@ impl LogicalVolume for Lvol {
     }
 
     fn snapshot_uuid(&self) -> Option<String> {
-        Lvol::get_blob_xattr(self.blob_checked(), CloneXattrs::SourceUuid.name())
+        self.blob_xattr(CloneXattrs::SourceUuid).map(Into::into)
     }
 
     fn share_protocol(&self) -> Protocol {
@@ -744,21 +821,11 @@ impl LvsLvol for Lvol {
     }
 
     /// Lvol is considered as clone if its sourceuuid attribute is a valid
-    /// snapshot. if it is clone, return the snapshot lvol.
-    fn is_snapshot_clone(&self) -> Option<Lvol> {
-        if let Some(source_uuid) =
-            Lvol::get_blob_xattr(self.blob_checked(), CloneXattrs::SourceUuid.name())
-        {
-            let snap_lvol = match UntypedBdev::lookup_by_uuid_str(source_uuid.as_str()) {
-                Some(bdev) => match Lvol::try_from(bdev) {
-                    Ok(l) => l,
-                    _ => return None,
-                },
-                None => return None,
-            };
-            return Some(snap_lvol);
-        }
-        None
+    /// snapshot.
+    /// And if it is clone, return the snapshot Lvol.
+    fn clone_source(&self) -> Option<Lvol> {
+        let source_uuid = self.blob_xattr(CloneXattrs::SourceUuid)?;
+        self.lvs().lookup_lvol_by_uuid_str(source_uuid)
     }
 
     /// Get/Read a property of this lvol from the in-memory metadata copy.
@@ -781,12 +848,7 @@ impl LvsLvol for Lvol {
             prop,
             name: self.name(),
         })?;
-        let einval = || {
-            Err(LvsError::Property {
-                source: BsError::InvalidArgument {},
-                name: self.name(),
-            })
-        };
+        let einval = || Err(LvsError::Property { name: self.name() });
 
         match prop {
             PropName::Shared => match unsafe { CStr::from_ptr(value).to_str() } {
@@ -822,7 +884,9 @@ impl LvsLvol for Lvol {
         }
         self.reset_snapshot_tree_usage_cache(!self.is_snapshot());
         // We must always unshare before destroying bdev.
-        let _ = Pin::new(&mut self).unshare().await;
+        let _ = Pin::new(&mut self)
+            .unshare(Some(UnshareProps::new(false)))
+            .await;
 
         let name = self.name();
         let ptpl = self.ptpl();
@@ -996,7 +1060,7 @@ impl LvsLvol for Lvol {
     /// Wrapper function to destroy replica and its associated snapshot if
     /// replica is identified as last clone.
     async fn destroy_replica(mut self) -> Result<String, LvsError> {
-        let snapshot_lvol = self.is_snapshot_clone();
+        let snapshot_lvol = self.clone_source();
         let name = self.name();
         self.destroy().await?;
 
@@ -1004,9 +1068,7 @@ impl LvsLvol for Lvol {
         // clone from the snapshot, destroy the snapshot
         // if it is already marked as discarded snapshot.
         if let Some(snapshot_lvol) = snapshot_lvol {
-            if snapshot_lvol.list_clones_by_snapshot_uuid().is_empty()
-                && snapshot_lvol.is_discarded_snapshot()
-            {
+            if !snapshot_lvol.has_clones() && snapshot_lvol.is_discarded_snapshot() {
                 snapshot_lvol.destroy().await?;
             }
         }

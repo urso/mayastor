@@ -124,6 +124,14 @@ impl GetName for Nvmf {
     }
 }
 
+impl super::Probe for Nvmf {
+    fn probe(&self, _opts: &super::ProbeOpts) -> Result<(), super::ProbeError> {
+        // eventually this means we need probe to be async, and check if we can
+        // at least discover the device.
+        Ok(())
+    }
+}
+
 #[async_trait(?Send)]
 impl CreateDestroy for Nvmf {
     type Error = BdevError;

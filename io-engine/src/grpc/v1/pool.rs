@@ -1,13 +1,17 @@
 pub use crate::pool_backend::FindPoolArgs as PoolIdProbe;
 use crate::{
     bdev::crypto::{Cipher, EncryptionKey as PoolEncKey},
-    core::{NvmfShareProps, ProtectedSubsystems, Protocol, ResourceLockGuard, ResourceLockManager},
+    core::{
+        BdevErrorStats, MayastorEnvironment, NvmfShareProps, ProtectedSubsystems, Protocol,
+        ResourceLockGuard, ResourceLockManager,
+    },
     grpc::{acquire_subsystem_lock, GrpcClientContext, GrpcResult, RWLock, RWSerializer},
     lvs::{BsError, LvsError},
     pool_backend::{
         self, FindPoolArgs, IPoolFactory, ListPoolArgs, PoolArgs, PoolBackend, PoolFactory,
         PoolOps, Raid0Config, ReplicaArgs,
     },
+    pool_information::pool_info_read,
 };
 use ::function_name::named;
 use futures::FutureExt;
@@ -19,12 +23,28 @@ use io_engine_api::v1::{
 };
 use secret_provider::secret_data;
 use std::{
+    collections::HashMap,
     convert::{TryFrom, TryInto},
     fmt::Debug,
     ops::Deref,
     panic::AssertUnwindSafe,
 };
 use tonic::{Code, Request, Status};
+
+trait AsyncFrom<T>: Sized {
+    async fn async_from(value: T) -> Self;
+}
+trait AsyncInto<T>: Sized {
+    async fn async_into(self) -> T;
+}
+impl<T, U> AsyncInto<U> for T
+where
+    U: AsyncFrom<T>,
+{
+    async fn async_into(self) -> U {
+        U::async_from(self).await
+    }
+}
 
 pub type PoolCreateEncryptionParams = create_pool_request::Encryption;
 pub type PoolImportEncryptionParams = import_pool_request::Encryption;
@@ -63,6 +83,11 @@ impl From<ExportPoolRequest> for FindPoolArgs {
 }
 impl From<GrowPoolRequest> for FindPoolArgs {
     fn from(value: GrowPoolRequest) -> Self {
+        Self::name_uuid(value.name, &value.uuid)
+    }
+}
+impl From<ClearErrorRequest> for FindPoolArgs {
+    fn from(value: ClearErrorRequest) -> Self {
         Self::name_uuid(value.name, &value.uuid)
     }
 }
@@ -199,7 +224,7 @@ impl TryFrom<EncryptionData> for PoolEncKey {
         } else {
             return Err(LvsError::Invalid {
                 source: BsError::InvalidArgument {},
-                msg: "invalid argument, missing key".to_string(),
+                msg: "missing key".to_string(),
             });
         };
 
@@ -228,7 +253,7 @@ impl TryFrom<CreatePoolRequest> for PoolArgs {
         if args.disks.is_empty() {
             return Err(LvsError::Invalid {
                 source: BsError::InvalidArgument {},
-                msg: "invalid argument, missing devices".to_string(),
+                msg: "missing devices".to_string(),
             });
         }
 
@@ -255,6 +280,7 @@ impl TryFrom<CreatePoolRequest> for PoolArgs {
             enc_key: None,
             crypto_vbdev_name: None,
             raid_config: args.xata_raid_config.map(TryFrom::try_from).transpose()?,
+            no_spdk: false,
         })
     }
 }
@@ -326,7 +352,7 @@ impl TryFrom<ImportPoolRequest> for PoolArgs {
         if args.disks.is_empty() {
             return Err(LvsError::Invalid {
                 source: BsError::InvalidArgument {},
-                msg: "invalid argument, missing devices".to_string(),
+                msg: "missing devices".to_string(),
             });
         }
 
@@ -335,8 +361,8 @@ impl TryFrom<ImportPoolRequest> for PoolArgs {
             msg: format!("invalid pooltype provided: {}", args.pooltype),
         })?;
         if backend == PoolType::Lvs {
-            if let Some(s) = args.uuid.clone() {
-                let _uuid = uuid::Uuid::parse_str(s.as_str()).map_err(|e| LvsError::Invalid {
+            if let Some(ref s) = args.uuid {
+                let _uuid = uuid::Uuid::parse_str(s).map_err(|e| LvsError::Invalid {
                     source: BsError::InvalidArgument {},
                     msg: format!("invalid uuid provided, {e}"),
                 })?;
@@ -362,6 +388,7 @@ impl TryFrom<ImportPoolRequest> for PoolArgs {
                 .as_ref()
                 .map(|_| format!("crypto_{}", args.name)),
             raid_config: args.xata_raid_config.map(TryFrom::try_from).transpose()?,
+            no_spdk: false,
         })
     }
 }
@@ -401,7 +428,8 @@ impl PoolGrpc {
                 uuid: args.uuid,
                 thin: args.thin,
                 entity_id: args.entity_id,
-                use_extent_table: None,
+                wipe_super: true,
+                ..Default::default()
             })
             .await
         {
@@ -440,25 +468,166 @@ impl PoolGrpc {
         self.pool.grow().await?;
         Ok(())
     }
+    async fn clear_errors(&self) -> Result<(), tonic::Status> {
+        self.pool.reset_errors().await?;
+        Ok(())
+    }
     /// Access the `PoolOps` from this wrapper.
     pub(crate) fn as_ops(&self) -> &dyn PoolOps {
         self.pool.deref()
     }
 }
 
-impl From<Box<dyn PoolOps>> for Pool {
-    fn from(value: Box<dyn PoolOps>) -> Self {
-        let value = value.deref();
-        value.into()
+struct PoolErrorsNt(PoolErrors);
+impl Deref for PoolErrorsNt {
+    type Target = PoolErrors;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
-impl From<&dyn PoolOps> for Pool {
-    fn from(value: &dyn PoolOps) -> Self {
+impl PoolErrorsNt {
+    fn new(pool: &str, environ: &MayastorEnvironment, stats: &BdevErrorStats) -> Self {
+        let mut io_stalled = false;
+        let mut io_stall_transition_count: u64 = 0;
+
+        let cache = pool_info_read();
+
+        if let Some(pool_lock) = cache.get(pool) {
+            let mut pool_mut = pool_lock.write();
+            pool_mut.update_transition_timestamp(*environ.pool_args.io_stall_transition_window);
+            io_stalled = pool_mut.io_stalled;
+            io_stall_transition_count = pool_mut.transition_timestamps.len() as u64;
+        }
+
+        Self(PoolErrors {
+            alerts: None,
+            io_error_count: stats.error_count(),
+            io_error_threshold: environ.pool_args.io_error_threshold,
+            io_stalled,
+            io_stall_transition_count,
+            io_stall_transition_threshold: environ.pool_args.io_stall_transition_threshold,
+        })
+    }
+    fn with_io_errors(mut self) -> Self {
+        match self.io_error_count {
+            0 => {}
+            errors if errors < self.io_error_threshold => {
+                self.set_alert(PoolAlertStatus::Attention, PoolAlert::IoError)
+            }
+            _ => self.set_alert(PoolAlertStatus::Warning, PoolAlert::IoErrorExc),
+        }
+        self
+    }
+    fn with_io_stall(mut self) -> Self {
+        if self.io_stalled {
+            self.set_alert(PoolAlertStatus::Critical, PoolAlert::IoStalled);
+        }
+        match self.io_stall_transition_count {
+            // todo: Notice should be raised on 1 transition.
+            0 | 1 => {}
+            num_stalls if num_stalls < self.io_stall_transition_threshold => {
+                self.set_alert(PoolAlertStatus::Attention, PoolAlert::IoStallIntermittent)
+            }
+            _ => self.set_alert(PoolAlertStatus::Warning, PoolAlert::IoStallIntermittentExc),
+        }
+        self
+    }
+    fn lower_status(&mut self, status: PoolAlertStatus) {
+        let status = status as i32;
+        if status > self.status() {
+            self.set_status(status);
+        }
+    }
+    fn set_status(&mut self, status: i32) {
+        match self.0.alerts.as_mut() {
+            None => {
+                let alerts = PoolAlerts {
+                    status,
+                    ..Default::default()
+                };
+                self.0.alerts = Some(alerts);
+            }
+            Some(alerts) => {
+                alerts.status = status;
+            }
+        }
+    }
+    fn set_alert(&mut self, status: PoolAlertStatus, alert: PoolAlert) {
+        match self.0.alerts.as_mut() {
+            None => {
+                let mut alerts = PoolAlerts {
+                    status: status as i32,
+                    ..Default::default()
+                };
+                Self::set_alert_(&mut alerts, status, alert);
+                self.0.alerts = Some(alerts);
+            }
+            Some(alerts) => {
+                Self::set_alert_(alerts, status, alert);
+                self.lower_status(status);
+            }
+        }
+    }
+    fn set_alert_(alerts: &mut PoolAlerts, status: PoolAlertStatus, alert: PoolAlert) {
+        match status {
+            PoolAlertStatus::Healthy => {
+                alerts.notice.push(alert as i32);
+            }
+            PoolAlertStatus::Attention => {
+                alerts.attention.push(alert as i32);
+            }
+            PoolAlertStatus::Warning => {
+                alerts.warning.push(alert as i32);
+            }
+            PoolAlertStatus::Critical => {
+                alerts.critical.push(alert as i32);
+            }
+        }
+    }
+    fn status(&self) -> i32 {
+        self.0.alerts.as_ref().map(|a| a.status).unwrap_or_default()
+    }
+    fn state(&self) -> PoolState {
+        match &self.alerts {
+            Some(alerts) if alerts.status >= PoolAlertStatus::Warning as i32 => {
+                PoolState::PoolSuspected
+            }
+            _ => PoolState::PoolOnline,
+        }
+    }
+    fn build(self) -> PoolErrors {
+        self.0
+    }
+}
+
+/// Convert something which implements [`PoolOps`] to the proto `Pool` type.
+pub async fn pool_to_proto(pool: &dyn PoolOps) -> Pool {
+    pool.async_into().await
+}
+
+impl AsyncFrom<Box<dyn PoolOps>> for Pool {
+    async fn async_from(value: Box<dyn PoolOps>) -> Self {
+        let value = value.deref();
+        value.async_into().await
+    }
+}
+impl AsyncFrom<&dyn PoolOps> for Pool {
+    async fn async_from(value: &dyn PoolOps) -> Self {
+        let stats = value.error_stats().await.ok();
+
+        let errors = stats.as_ref().map(|stats| {
+            let environ = MayastorEnvironment::global();
+            PoolErrorsNt::new(value.name(), &environ, stats)
+                .with_io_errors()
+                .with_io_stall()
+        });
+        let state = errors.as_ref().map(|errors| errors.state());
+        let errors = errors.map(PoolErrorsNt::build);
         Self {
             uuid: value.uuid(),
             name: value.name().into(),
             disks: value.disks(),
-            state: PoolState::PoolOnline.into(),
+            state: state.unwrap_or(PoolState::PoolOnline).into(),
             capacity: value.capacity(),
             used: value.used(),
             committed: value.committed(),
@@ -470,9 +639,19 @@ impl From<&dyn PoolOps> for Pool {
             encrypted: Some(value.encrypted()),
             max_expandable_size: value.max_expandable_size(),
             xata_raid_info: value.raid_info().map(|raid| raid.into()),
+            disk_info: value
+                .disks()
+                .into_iter()
+                .map(|uri| DiskInfo {
+                    uri,
+                    errors: errors.clone(),
+                })
+                .collect(),
+            errors,
         }
     }
 }
+
 impl From<pool_backend::PoolMetadataInfo> for PoolMetadataInfo {
     fn from(value: pool_backend::PoolMetadataInfo) -> Self {
         Self {
@@ -535,7 +714,11 @@ impl GrpcPoolFactory {
     }
     async fn list(&self, args: &ListPoolArgs) -> Result<Vec<Pool>, Status> {
         let pools = self.as_factory().list(args).await?;
-        Ok(pools.into_iter().map(Into::into).collect::<Vec<_>>())
+        let mut ret_pools = Vec::with_capacity(pools.len());
+        for pool in pools {
+            ret_pools.push(pool.async_into().await);
+        }
+        Ok(ret_pools)
     }
     /// Lists all `PoolOps` matching the given arguments.
     pub(crate) async fn list_ops(
@@ -580,7 +763,7 @@ impl GrpcPoolFactory {
             factory.ensure_not_found(&finder, args.backend).await?;
         }
         let pool = self.as_factory().create(args).await?;
-        Ok(pool.into())
+        Ok(pool.async_into().await)
     }
     async fn import(&self, args: PoolArgs) -> Result<Pool, Status> {
         let pool_subsystem =
@@ -592,7 +775,7 @@ impl GrpcPoolFactory {
             factory.ensure_not_found(&finder, args.backend).await?;
         }
         let pool = self.as_factory().import(args).await?;
-        Ok(pool.into())
+        Ok(pool.async_into().await)
     }
     fn as_factory(&self) -> &dyn IPoolFactory {
         self.0.as_factory()
@@ -756,11 +939,88 @@ impl PoolRpc for PoolService {
                     info!("{:?}", request.get_ref());
                     let pool = GrpcPoolFactory::finder(request.into_inner()).await?;
                     pool.grow().await?;
-                    let current_pool = Pool::from(pool.as_ops());
-                    Ok(current_pool)
+                    Ok(Pool::async_from(pool.as_ops()).await)
                 })
             },
         )
         .await
+    }
+
+    #[named]
+    async fn clear_errors(&self, request: Request<ClearErrorRequest>) -> GrpcResult<Pool> {
+        self.locked(
+            GrpcClientContext::new(&request, function_name!()),
+            async move {
+                crate::spdk_submit!(async move {
+                    info!("{:?}", request.get_ref());
+                    let pool = GrpcPoolFactory::finder(request.into_inner()).await?;
+                    pool.clear_errors().await?;
+                    Ok(Pool::async_from(pool.as_ops()).await)
+                })
+            },
+        )
+        .await
+    }
+
+    async fn probe_pool(
+        &self,
+        request: Request<ProbePoolRequest>,
+    ) -> GrpcResult<ProbePoolResponse> {
+        let request = request.into_inner();
+
+        // todo: implement probes
+        if request.probes.is_some() {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                "Pool probes are not implemented",
+            ));
+        }
+        let opts = crate::bdev::ProbeOpts {
+            import: request.import,
+        };
+        let Some(request) = request.request else {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                "Pool import request is missing",
+            ));
+        };
+        if request.disks.is_empty() {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                "No pool disks specified",
+            ));
+        }
+
+        let mut errors = HashMap::new();
+        for disk_uri in request.disks {
+            let parsed = match crate::bdev::uri::try_parse_or_aio(&disk_uri) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let error = vec![ProbeError {
+                        code: ProbeErrorCode::InvalidDiskUri as i32,
+                        msg: Some(error.to_string()),
+                    }];
+                    let disk = disk_uri.clone();
+                    let info = ProbeDiskInfo { disk, error };
+                    errors.insert(disk_uri, info);
+                    continue;
+                }
+            };
+            let Err(error) = parsed.probe(&opts) else {
+                continue;
+            };
+
+            let error = vec![error];
+            let disk = disk_uri.clone();
+            let info = ProbeDiskInfo { disk, error };
+            errors.insert(disk_uri, info);
+        }
+
+        Ok(tonic::Response::new(ProbePoolResponse {
+            success: errors.is_empty(),
+            probed: None,
+            metadata: None,
+            errors,
+        }))
     }
 }

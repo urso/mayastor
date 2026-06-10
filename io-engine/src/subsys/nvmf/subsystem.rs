@@ -1,6 +1,6 @@
 use std::{
     convert::TryFrom,
-    ffi::{c_void, CString},
+    ffi::{c_void, CStr, CString},
     fmt::{self, Debug, Display, Formatter},
     mem::zeroed,
     ptr::{self, NonNull},
@@ -11,8 +11,9 @@ use nix::errno::Errno;
 
 use spdk_rs::{
     libspdk::{
-        nvmf_subsystem_find_listener, spdk_nvmf_ctrlr_set_cpl_error_cb, spdk_nvmf_ns_get_bdev,
-        spdk_nvmf_ns_opts, spdk_nvmf_request, spdk_nvmf_subsystem, spdk_nvmf_subsystem_add_host,
+        nvmf_subsystem_find_listener, spdk_bit_array_find_first_clear,
+        spdk_nvmf_ctrlr_set_cpl_error_cb, spdk_nvmf_ns_get_bdev, spdk_nvmf_ns_opts,
+        spdk_nvmf_request, spdk_nvmf_subsystem, spdk_nvmf_subsystem_add_host,
         spdk_nvmf_subsystem_add_listener, spdk_nvmf_subsystem_add_ns_ext,
         spdk_nvmf_subsystem_create, spdk_nvmf_subsystem_destroy,
         spdk_nvmf_subsystem_disconnect_host, spdk_nvmf_subsystem_event,
@@ -26,8 +27,8 @@ use spdk_rs::{
         spdk_nvmf_subsystem_set_ana_state, spdk_nvmf_subsystem_set_cntlid_range,
         spdk_nvmf_subsystem_set_event_cb, spdk_nvmf_subsystem_set_mn, spdk_nvmf_subsystem_set_sn,
         spdk_nvmf_subsystem_start, spdk_nvmf_subsystem_state_change_done, spdk_nvmf_subsystem_stop,
-        spdk_nvmf_tgt, spdk_nvmf_tgt_get_transport, SPDK_NVME_SCT_GENERIC,
-        SPDK_NVME_SC_CAPACITY_EXCEEDED, SPDK_NVME_SC_RESERVATION_CONFLICT,
+        spdk_nvmf_tgt, spdk_nvmf_tgt_find_subsystem, spdk_nvmf_tgt_get_transport,
+        SPDK_NVME_SCT_GENERIC, SPDK_NVME_SC_CAPACITY_EXCEEDED, SPDK_NVME_SC_RESERVATION_CONFLICT,
         SPDK_NVMF_SUBTYPE_DISCOVERY, SPDK_NVMF_SUBTYPE_NVME,
     },
     struct_size_init, NvmeStatus, NvmfController, NvmfSubsystemEvent,
@@ -218,8 +219,7 @@ impl NvmfSubsystem {
         let event = NvmfSubsystemEvent::from_cb_args(event, ctx);
 
         debug!("NVMF subsystem event {s:?}: {event:?}");
-
-        let nqn_tgt = NqnTarget::lookup(&s.get_nqn());
+        let nqn_tgt = NqnTarget::from(&s);
         if matches!(nqn_tgt, NqnTarget::None) {
             warn!(
                 "NVMF subsystem event {s:?}: {event:?}: \
@@ -297,7 +297,7 @@ impl NvmfSubsystem {
             "Host '{host}' connected to subsystem '{subsys}' on \
             nexus '{nex:?}'",
             host = ctrlr.hostnqn(),
-            subsys = self.get_nqn(),
+            subsys = self.nqn_str(),
         );
 
         nex.add_initiator(&ctrlr.hostnqn());
@@ -317,7 +317,7 @@ impl NvmfSubsystem {
             "Host '{host}' disconnected from subsystem '{subsys}' on \
             nexus '{nex:?}'",
             host = ctrlr.hostnqn(),
-            subsys = self.get_nqn(),
+            subsys = self.nqn_str(),
         );
 
         nex.rm_initiator(&ctrlr.hostnqn());
@@ -333,7 +333,7 @@ impl NvmfSubsystem {
             "Host '{host}': keep alive timeout on subsystem '{subsys}' on \
             nexus '{nex:?}'",
             host = ctrlr.hostnqn(),
-            subsys = self.get_nqn(),
+            subsys = self.nqn_str(),
         );
 
         nex.initiator_keep_alive_timeout(&ctrlr.hostnqn());
@@ -369,7 +369,7 @@ impl NvmfSubsystem {
             "Host '{host}' connected to subsystem '{subsys}' on \
             replica '{lvol:?}'",
             host = ctrlr.hostnqn(),
-            subsys = self.get_nqn(),
+            subsys = self.nqn_str(),
         );
 
         unsafe {
@@ -387,7 +387,7 @@ impl NvmfSubsystem {
             "Host '{host}' disconnected from subsystem '{subsys}' on \
             replica '{lvol:?}'",
             host = ctrlr.hostnqn(),
-            subsys = self.get_nqn(),
+            subsys = self.nqn_str(),
         );
 
         unsafe {
@@ -401,23 +401,42 @@ impl NvmfSubsystem {
             "Host '{host}': keep alive timeout on subsystem '{subsys}' on \
             replica '{lvol:?}'",
             host = ctrlr.hostnqn(),
-            subsys = self.get_nqn(),
+            subsys = self.nqn_str(),
         );
     }
 
     /// create a new subsystem where the NQN is based on the UUID
     pub fn new(uuid: &str) -> Result<Self, Error> {
         let nqn = make_nqn(uuid).into_cstring();
-        let ss = NVMF_TGT
-            .with(|t| {
-                let tgt = t.borrow().tgt.as_ptr();
-                unsafe { spdk_nvmf_subsystem_create(tgt, nqn.as_ptr(), SPDK_NVMF_SUBTYPE_NVME, 1) }
-            })
-            .to_result(|_| Error::Subsystem {
-                source: Errno::EEXIST,
-                nqn: uuid.into(),
-                msg: "ss ptr is null".into(),
-            })?;
+
+        let ss = match NVMF_TGT.with(|t| {
+            let tgt = t.borrow().tgt.as_ptr();
+
+            let ss =
+                unsafe { spdk_nvmf_subsystem_create(tgt, nqn.as_ptr(), SPDK_NVMF_SUBTYPE_NVME, 1) };
+            if !ss.is_null() {
+                return Ok(ss);
+            }
+
+            // try to decipher why it's failed (the spdk_nvmf_subsystem_create provides no help)
+            if !unsafe { spdk_nvmf_tgt_find_subsystem(tgt, nqn.as_ptr()) }.is_null() {
+                return Err(Errno::EEXIST);
+            }
+            // check if we've hit the max number of namespaces/targets (since we have 1n-1t)
+            if unsafe { spdk_bit_array_find_first_clear((*tgt).subsystem_ids, 0) } == u32::MAX {
+                return Err(Errno::EMLINK);
+            }
+            Ok(ss)
+        }) {
+            Err(source) => Err(Error::SubsystemExt {
+                source,
+                nqn: nqn.to_string_lossy().to_string(),
+            }),
+            Ok(x) => x.to_result(|_| Error::SubsystemExt {
+                source: Errno::ENOMEM,
+                nqn: nqn.to_string_lossy().to_string(),
+            }),
+        }?;
 
         // Register subsystem event handler.
         unsafe {
@@ -549,12 +568,25 @@ impl NvmfSubsystem {
     }
 
     /// Get NVMe subsystem's NQN
+    /// # Warning
+    /// If used as a lookup, this can be very expensive when very large clusters as it's
+    /// allocating and copying a new string rather than returning a reference.
     pub fn get_nqn(&self) -> String {
         unsafe {
             spdk_nvmf_subsystem_get_nqn(self.0.as_ptr())
                 .as_str()
                 .to_string()
         }
+    }
+
+    /// Get NVMe subsystem's NQN as a [`CStr`] reference
+    pub fn nqn_cstr(&self) -> &CStr {
+        unsafe { CStr::from_ptr(spdk_nvmf_subsystem_get_nqn(self.0.as_ptr())) }
+    }
+
+    /// Get NVMe subsystem's NQN as a [`CStr`] reference
+    pub fn nqn_str(&self) -> &str {
+        self.nqn_cstr().to_str().unwrap_or("")
     }
 
     fn cstr(host: &str) -> Result<CString, Error> {
@@ -766,7 +798,7 @@ impl NvmfSubsystem {
             s.send(status).unwrap();
         }
 
-        info!(?self, "Subsystem {} in progress...", op);
+        info!(?self, "Subsystem {op} in progress...");
 
         let res = {
             let mut n = 0;
@@ -783,10 +815,8 @@ impl NvmfSubsystem {
                 n += 1;
 
                 warn!(
-                    "Failed to {} '{}': subsystem is busy, retrying {}...",
-                    op,
-                    self.get_nqn(),
-                    n
+                    "Failed to {op} '{}': subsystem is busy, retrying {n}...",
+                    self.nqn_str()
                 );
 
                 crate::sleep::mayastor_sleep(std::time::Duration::from_millis(100))
@@ -800,6 +830,7 @@ impl NvmfSubsystem {
                     nqn: self.get_nqn(),
                     msg: format!("{op} failed"),
                 }),
+                // this can't happen anymore, SPDK handles transitions in a q
                 libc::EBUSY => Err(Error::SubsystemBusy {
                     nqn: self.get_nqn(),
                     op: op.to_owned(),
@@ -813,9 +844,9 @@ impl NvmfSubsystem {
         };
 
         if let Err(ref e) = res {
-            error!(?self, "Subsystem {} failed: {}", op, e.to_string());
+            error!(?self, "Subsystem {op} failed: {e}");
         } else {
-            info!(?self, "Subsystem {} completed: Ok", op);
+            info!(?self, "Subsystem {op} completed: Ok");
         }
 
         res
@@ -990,13 +1021,26 @@ impl NvmfSubsystem {
         })
     }
 
-    /// lookup a subsystem by its UUID
+    /// Lookup a subsystem by its UUID.
+    /// # Warning
+    /// This is a misnomer, as the function input is a name/uuid!
     pub fn nqn_lookup(uuid: &str) -> Option<NvmfSubsystem> {
         let nqn = make_nqn(uuid);
-        NvmfSubsystem::first()
-            .unwrap()
-            .into_iter()
-            .find(|s| s.get_nqn() == nqn)
+        Self::nqn_lookup_(&nqn)
+    }
+
+    /// Lookup a subsystem by its nqn.
+    pub fn nqn_lookup_(nqn: &str) -> Option<NvmfSubsystem> {
+        NVMF_TGT.with(|t| {
+            let nqn = nqn.into_cstring();
+            let ss = unsafe { spdk_nvmf_tgt_find_subsystem(t.borrow().tgt.as_ptr(), nqn.as_ptr()) };
+
+            if ss.is_null() {
+                None
+            } else {
+                Some(NvmfSubsystem(NonNull::new(ss).unwrap()))
+            }
+        })
     }
 
     /// get the bdev associated with this subsystem -- we implicitly assume the
@@ -1059,12 +1103,9 @@ impl NvmfSubsystem {
 
     /// return the URI's this subsystem is listening on
     pub fn uri_endpoints(&self) -> Option<Vec<String>> {
-        if let Some(v) = self.listeners_to_vec() {
-            let nqn = self.get_nqn();
-            Some(v.iter().map(|t| format!("{t}/{nqn}")).collect::<Vec<_>>())
-        } else {
-            None
-        }
+        let nqn = self.nqn_str();
+        self.listeners_to_vec()
+            .map(|v| v.iter().map(|t| format!("{t}/{nqn}")).collect())
     }
 }
 
@@ -1080,31 +1121,15 @@ pub enum NqnTarget<'a> {
     None,
 }
 
-impl NqnTarget<'_> {
-    pub fn lookup(nqn: &str) -> Self {
-        let Some(bdev) = UntypedBdev::bdev_first() else {
+impl From<&'_ NvmfSubsystem> for NqnTarget<'_> {
+    fn from(value: &'_ NvmfSubsystem) -> Self {
+        let Some(bdev) = value.bdev() else {
             return Self::None;
         };
-
-        let parts: Vec<&str> = nqn.split(':').collect();
-        if parts.len() != 2 || parts[0] != NVME_NQN_PREFIX {
-            return Self::None;
+        match bdev.driver() {
+            NEXUS_MODULE_NAME => Self::Nexus(unsafe { Nexus::unsafe_from_untyped_bdev(*bdev) }),
+            "lvol" => Lvol::try_from(bdev).map_or(Self::None, Self::Replica),
+            _ => Self::None,
         }
-
-        let name = parts[1];
-
-        for b in bdev.into_iter() {
-            match b.driver() {
-                NEXUS_MODULE_NAME if b.name() == name => {
-                    return Self::Nexus(unsafe { Nexus::unsafe_from_untyped_bdev(*b) });
-                }
-                "lvol" if b.name() == name => {
-                    return Lvol::try_from(b).map_or(Self::None, Self::Replica)
-                }
-                _ => {}
-            }
-        }
-
-        Self::None
     }
 }

@@ -46,6 +46,7 @@ use crate::{
     grpc,
     grpc::MayastorGrpcServer,
     logger,
+    logger::FmtSpan,
     persistent_store::PersistentStoreBuilder,
     subsys::{
         self, config::opts::TARGET_CRDT_LEN, registration::registration_grpc::ApiVersion, Config,
@@ -145,12 +146,16 @@ pub struct MayastorCliArgs {
     #[clap(short = 'R')]
     /// Registration grpc endpoint
     pub registration_endpoint: Option<Uri>,
-    #[clap(short = 'L')]
-    /// Enable logging for sub components.
+    #[clap(long, short = 'L')]
+    /// Enable logging for SPDK sub-components.
     pub log_components: Vec<String>,
-    #[clap(short = 'F')]
-    /// Log format.
+    #[clap(long, short = 'F', default_value = "default")]
+    /// The logging format. {n}
+    /// Possible values: [ default compact, json, color, nocolor, date, nodate, host, nohost ]. {n}
+    /// You can combine multiple values with commas, e.g. "-F=compact,nocolor,date".
     pub log_format: Option<logger::LogFormat>,
+    #[clap(long, default_value = "none")]
+    pub log_span_events: FmtSpan,
     #[clap(short = 'm', default_value = "0x1")]
     /// The reactor mask to be used for starting up the instance
     pub reactor_mask: String,
@@ -158,7 +163,8 @@ pub struct MayastorCliArgs {
     /// Name of the node where mayastor is running (ID used by control plane)
     pub node_name: Option<String>,
     /// The maximum amount of hugepage memory we are allowed to allocate in
-    /// MiB. A value of 0 means no limit.
+    /// MiB. {n}
+    /// A value of 0 means no limit.
     #[clap(short = 's', value_parser = parse_mb, default_value = "0")]
     pub mem_size: i32,
     #[clap(short = 'u')]
@@ -183,8 +189,8 @@ pub struct MayastorCliArgs {
     /// Pass additional arguments to the EAL environment.
     pub env_context: Option<String>,
     #[clap(short = 'l')]
-    /// List of cores to run on instead of using the core mask. When specified
-    /// it supersedes the core mask (-m) argument.
+    /// List of cores to run on instead of using the core mask. {n}
+    /// When specified it supersedes the core mask (-m) argument.
     pub core_list: Option<String>,
     #[clap(short = 'p')]
     /// Endpoint of the persistent store.
@@ -203,16 +209,15 @@ pub struct MayastorCliArgs {
     /// Number of entries in memory pool for bdev I/O contexts
     pub bdev_io_ctx_pool_size: u64,
     #[clap(long = "nvme-ctl-pool-size", default_value = "65535")]
-    /// Number of entries in memory pool for NVMe controller I/O contexts
+    /// Number of entries in memory pool for NVMe controller I/O contexts.
     pub nvme_ctl_io_ctx_pool_size: u64,
     #[clap(short = 'T', long = "tgt-iface", env = "NVMF_TGT_IFACE")]
     /// NVMF target interface (ip, mac, name or subnet).
     pub nvmf_tgt_interface: Option<String>,
-    /// NVMF target Command Retry Delay in x100 ms (single integer or three
-    /// comma-separated integers). First value is used for errors on nexus
-    /// target except reservation conflict and no space; second
-    /// value is used for reservation conflict and no space on nexus target;
-    /// third value is used for all errors on replica target.
+    /// NVMF target Command Retry Delay in x100 ms (single integer or three comma-separated integers): {n}
+    /// - first value is used for errors on nexus target except reservation conflict and no space {n}
+    /// - second value is used for reservation conflict and no space on nexus target {n}
+    /// - third value is used for all errors on replica target
     #[clap(
         long = "tgt-crdt",
         env = "NVMF_TGT_CRDT",
@@ -228,8 +233,7 @@ pub struct MayastorCliArgs {
         env = "API_VERSIONS"
     )]
     pub api_versions: Vec<ApiVersion>,
-    /// Dump stack trace for all threads inside I/O agent process with target
-    /// PID.
+    /// Dump stack trace for all threads inside I/O agent process with target PID.
     #[clap(short = 'd', long = "diagnose-stack", env = "DIAGNOSE_STACK")]
     pub diagnose_stack: Option<u32>,
     /// Enable reactor freeze detection.
@@ -238,14 +242,14 @@ pub struct MayastorCliArgs {
     /// Timeout (in seconds) for reactor freeze detection.
     #[clap(long = "reactor-freeze-timeout", env = "REACTOR_FREEZE_TIMEOUT")]
     pub reactor_freeze_timeout: Option<u64>,
-    /// Skip install of the signal handler which will trigger process graceful
-    /// termination.
+    /// Skip install of the signal handler which will trigger process graceful termination.
     #[clap(long, hide = true)]
     pub skip_sig_handler: bool,
-    /// Whether the nexus channel should have readers/writers configured.
+    /// Whether the nexus channel should have readers/writers configured. {n}
     /// This must be set true ONLY from tests. This option can be removed once
     /// dynamic reconfiguration of nexus channels can handle async-qpair
-    /// connect. Details in NexusChannel::new
+    /// connect. {n}
+    /// Details in [`NexusChannel::new`].
     #[clap(long = "enable-io-all-thrd-nexus-channels", hide = true)]
     pub enable_io_all_thrd_nexus_channels: bool,
     /// Events message-bus endpoint url.
@@ -261,8 +265,8 @@ pub struct MayastorCliArgs {
         hide = true
     )]
     pub enable_nexus_channel_debug: bool,
-    /// Enables experimental LVM backend support.
-    /// LVM pools can then be created by specifying the LVM pool type.
+    /// Enables experimental LVM backend support. {n}
+    /// LVM pools can then be created by specifying the LVM pool type. {n}
     /// If LVM is enabled and LVM_SUPPRESS_FD_WARNINGS is not set then it will
     /// be set to 1.
     #[clap(long = "enable-lvm", env = "ENABLE_LVM", value_parser = delay_compat)]
@@ -274,12 +278,125 @@ pub struct MayastorCliArgs {
     /// # Warning: Don't use this in production.
     #[clap(long, env = "MAYASTOR_DELAY", hide = true, value_parser = delay_compat)]
     pub developer_delay: bool,
+    /// Enable interrupt mode: reactors use epoll-based waiting instead of
+    /// busy-polling when idle, dramatically reducing CPU usage. {n}
+    /// Warning: Experimental. NVMe-oF TCP targets only.
+    #[clap(long = "enable-interrupt-mode", env = "ENABLE_INTERRUPT_MODE", value_parser = delay_compat)]
+    pub interrupt_mode: bool,
     /// Enables RDMA between initiator and Mayastor Nvmf target.
     #[clap(long = "enable-rdma", env = "ENABLE_RDMA", value_parser = delay_compat)]
     pub rdma: bool,
     /// Enables globally blob store cluster release on unmap.
     #[clap(long, env = "ENABLE_BS_CLUSTER_UNMAP", hide = true)]
     pub bs_cluster_unmap: bool,
+    /// Enable core dump by setting ulimit -c. {n}
+    /// You may specify a limit value or otherwise DEFAULT_CORE_LIMIT=5GiB is used. {n}
+    /// Enabled by default on debug builds.
+    #[clap(long, env = "ENABLE_COREDUMP", num_args(0..=1))]
+    pub enable_coredump: Option<Option<u64>>,
+
+    /// [`PoolCliArgs`].
+    #[clap(flatten)]
+    pub pool: PoolCliArgs,
+
+    /// [`SpdkTracingArgs`].
+    #[clap(flatten)]
+    pub traces: SpdkTracingArgs,
+
+    /// [`NvmeCliArgs`].
+    #[clap(flatten)]
+    pub nvme: NvmeCliArgs,
+}
+
+/// SPDK tracing related arguments.
+#[derive(Debug, clap::Parser, Clone)]
+pub struct SpdkTracingArgs {
+    /// Number of trace entries per lcore.
+    #[clap(
+        long = "spdk-tracing-entries",
+        env = "SPDK_TRACING_ENTRIES",
+        default_value_t = 0
+    )]
+    pub entries: u64,
+    /// Number of user created threads.
+    #[clap(
+        long = "spdk-tracing-threads",
+        env = "SPDK_TRACING_THREADS",
+        default_value_t = 1
+    )]
+    pub threads: u32,
+}
+impl Default for SpdkTracingArgs {
+    fn default() -> Self {
+        Self::parse_from(Vec::<String>::new())
+    }
+}
+
+/// DiskPool related arguments.
+#[derive(Debug, clap::Parser, Clone)]
+pub struct PoolCliArgs {
+    /// I/O error count threshold. {n}
+    /// After this many errors a pool alert is raised as Warning.
+    #[clap(
+        long = "pool-io-error-threshold",
+        env = "POOL_IO_ERROR_THRESHOLD",
+        default_value_t = 8
+    )]
+    pub io_error_threshold: u64,
+
+    /// I/O stall deadline. {n}
+    /// If an I/O is stuck longer than this period, then the pool is considered stalled and a
+    /// Critical alert is raised. {n}
+    /// The pool disk will also be reset and the stall will be cleared once complete and
+    /// I/O flows again.
+    #[clap(
+        long = "pool-io-stall-deadline",
+        env = "POOL_IO_STALL_DEADLINE",
+        default_value = "30s"
+    )]
+    pub io_stall_deadline: humantime::Duration,
+
+    /// I/O stall transitions threshold. {n}
+    /// After this many transitions within the window, a pool alert is raised as Warning.
+    #[clap(
+        long = "pool-io-stall-transition-threshold",
+        env = "POOL_IO_STALL_TRANSITION_THRESHOLD",
+        default_value_t = 3
+    )]
+    pub io_stall_transition_threshold: u64,
+
+    /// I/O stall transitions window. {n}
+    /// Time window during which stall ↔ resume state transitions are tracked
+    /// for flakiness detection.
+    #[clap(
+        long = "pool-io-stall-transition-window",
+        env = "POOL_IO_STALL_TRANSITION_WINDOW",
+        default_value = "3h"
+    )]
+    pub io_stall_transition_window: humantime::Duration,
+}
+impl Default for PoolCliArgs {
+    fn default() -> Self {
+        Self::parse_from(Vec::<String>::new())
+    }
+}
+
+/// NVMe related arguments.
+#[derive(Debug, clap::Parser, Clone)]
+pub struct NvmeCliArgs {
+    /// Maximum number of NVMe namespaces we can expose. {n}
+    /// As of today, there's a 1-1 mapping of namespaces to nvmf targets.
+    #[clap(
+        long = "nvme-max-namespaces",
+        env = "NVME_MAX_NAMESPACES",
+        default_value_t = 4096
+    )]
+    pub max_namespaces: u32,
+}
+impl Default for NvmeCliArgs {
+    fn default() -> Self {
+        Self::parse_from(Vec::<String>::new())
+    }
 }
 
 fn delay_compat(s: &str) -> Result<bool, String> {
@@ -315,47 +432,7 @@ impl MayastorFeatures {
 /// Defaults are redefined here in case of using it during tests
 impl Default for MayastorCliArgs {
     fn default() -> Self {
-        #[allow(deprecated)]
-        Self {
-            deprecated_grpc_endpoint: None,
-            grpc_ip: std::net::Ipv6Addr::UNSPECIFIED.into(),
-            grpc_port: 10124,
-            ps_endpoint: None,
-            ps_timeout: Duration::from_secs(10),
-            ps_retries: 30,
-            node_name: None,
-            env_context: None,
-            reactor_mask: "0x1".into(),
-            mem_size: 0,
-            rpc_address: "/var/tmp/mayastor.sock".to_string(),
-            no_pci: false,
-            log_components: vec![],
-            log_format: None,
-            mayastor_config: None,
-            ptpl_dir: None,
-            pool_config: None,
-            hugedir: None,
-            core_list: None,
-            bdev_io_ctx_pool_size: 65535,
-            nvme_ctl_io_ctx_pool_size: 65535,
-            registration_endpoint: None,
-            nvmf_tgt_interface: None,
-            nvmf_tgt_crdt: [0; TARGET_CRDT_LEN],
-            api_versions: vec![ApiVersion::V0, ApiVersion::V1],
-            diagnose_stack: None,
-            reactor_freeze_detection: false,
-            reactor_freeze_timeout: None,
-            skip_sig_handler: false,
-            enable_io_all_thrd_nexus_channels: false,
-            events_url: None,
-            events_replicas: None,
-            enable_nexus_channel_debug: false,
-            lvm: false,
-            snap_rebuild: false,
-            developer_delay: false,
-            rdma: false,
-            bs_cluster_unmap: false,
-        }
+        MayastorCliArgs::parse_from(Vec::<String>::new())
     }
 }
 
@@ -420,7 +497,7 @@ pub struct MayastorEnvironment {
     pub mem_size: i32,
     pub name: String,
     no_pci: bool,
-    num_entries: u64,
+    traces: SpdkTracingArgs,
     num_pci_addr: usize,
     pci_blocklist: Vec<spdk_pci_addr>,
     pci_allowlist: Vec<spdk_pci_addr>,
@@ -443,8 +520,11 @@ pub struct MayastorEnvironment {
     skip_sig_handler: bool,
     enable_io_all_thrd_nexus_channels: bool,
     developer_delay: bool,
+    interrupt_mode: bool,
     rdma: bool,
     bs_cluster_unmap: bool,
+    pub pool_args: PoolCliArgs,
+    pub nvme: NvmeCliArgs,
 }
 
 impl Default for MayastorEnvironment {
@@ -471,7 +551,6 @@ impl Default for MayastorEnvironment {
             mem_size: -1,
             name: "mayastor".into(),
             no_pci: false,
-            num_entries: 0,
             num_pci_addr: 0,
             pci_blocklist: vec![],
             pci_allowlist: vec![],
@@ -493,8 +572,12 @@ impl Default for MayastorEnvironment {
             skip_sig_handler: false,
             enable_io_all_thrd_nexus_channels: false,
             developer_delay: false,
+            interrupt_mode: false,
             rdma: false,
             bs_cluster_unmap: false,
+            pool_args: PoolCliArgs::default(),
+            traces: SpdkTracingArgs::default(),
+            nvme: NvmeCliArgs::default(),
         }
     }
 }
@@ -557,12 +640,15 @@ pub fn mayastor_env_stop(rc: i32) {
     let r = Reactors::master();
 
     match r.get_state() {
-        ReactorState::Running | ReactorState::Delayed | ReactorState::Init => {
+        ReactorState::Running
+        | ReactorState::Delayed
+        | ReactorState::Init
+        | ReactorState::Interrupt => {
             r.send_future(async move {
                 do_shutdown(rc as *const i32 as *mut c_void).await;
             });
         }
-        _ => {
+        ReactorState::Shutdown => {
             panic!("invalid reactor state during shutdown");
         }
     }
@@ -633,9 +719,13 @@ impl MayastorEnvironment {
             api_versions: args.api_versions,
             skip_sig_handler: args.skip_sig_handler,
             developer_delay: args.developer_delay,
+            interrupt_mode: args.interrupt_mode,
             rdma: args.rdma,
             bs_cluster_unmap: args.bs_cluster_unmap,
             enable_io_all_thrd_nexus_channels: args.enable_io_all_thrd_nexus_channels,
+            pool_args: args.pool,
+            traces: args.traces,
+            nvme: args.nvme,
             ..Default::default()
         }
         .setup_static()
@@ -664,6 +754,17 @@ impl MayastorEnvironment {
         match MAYASTOR_DEFAULT_ENV.get() {
             Some(env) => env.lock().clone(),
             None => MayastorEnvironment::default(),
+        }
+    }
+
+    /// Get the global environment (first created on new)
+    /// or otherwise the default one (used by the tests)
+    /// # Warning
+    /// Panics if used before the environment is set.
+    pub fn global() -> parking_lot::MutexGuard<'static, Self> {
+        match MAYASTOR_DEFAULT_ENV.get() {
+            Some(env) => env.lock(),
+            None => panic!("Environment not setup"),
         }
     }
 
@@ -989,9 +1090,16 @@ impl MayastorEnvironment {
         None
     }
 
+    /// You can capture snapshot of the traces using the spdk utils and backtrace config, exampl:
+    /// sudo -E ./scripts/bpftrace.sh $(pidof io-engine) scripts/bpf/nvmf.bt
+    /// # NOTE
+    /// You may have to remove the top trace on scripts/bpf/nvmf.bt : nvmf_tgt_state
     fn init_spdk_tracing(&self) {
-        const MAX_GROUP_IDS: u32 = 16;
-        const NUM_THREADS: u32 = 1;
+        if self.traces.entries == 0 {
+            return;
+        }
+
+        tracing::info!(traces=?self.traces, "Enabling SPDK Tracing");
         let cshm_name = if self.shm_id >= 0 {
             CString::new(format!("/{}_trace.{}", self.name, self.shm_id).as_str()).unwrap()
         } else {
@@ -999,7 +1107,7 @@ impl MayastorEnvironment {
                 .unwrap()
         };
         unsafe {
-            if spdk_trace_init(cshm_name.as_ptr(), self.num_entries, NUM_THREADS) != 0 {
+            if spdk_trace_init(cshm_name.as_ptr(), self.traces.entries, self.traces.threads) != 0 {
                 error!("SPDK tracing init error");
             }
         }
@@ -1007,7 +1115,7 @@ impl MayastorEnvironment {
         let tpoint_group_mask =
             unsafe { spdk_trace_create_tpoint_group_mask(tpoint_group_name.as_ptr()) };
 
-        for group_id in 0..MAX_GROUP_IDS {
+        for group_id in 0..spdk_rs::libspdk::SPDK_TRACE_MAX_GROUP_ID {
             if (tpoint_group_mask & (1 << group_id) as u64) > 0 {
                 unsafe {
                     spdk_trace_set_tpoints(group_id, u64::MAX);
@@ -1059,7 +1167,7 @@ impl MayastorEnvironment {
         }
 
         // allocate a Reactor per core
-        Reactors::init(self.developer_delay);
+        Reactors::init(self.developer_delay, self.interrupt_mode);
 
         // launch the remote cores if any. note that during init these have to
         // be running as during setup cross call will take place.
@@ -1084,10 +1192,8 @@ impl MayastorEnvironment {
         // ensure we are within the context of a spdk thread from here
         Mthread::primary().set_current();
 
-        // To enable SPDK tracing set self.num_entries (eg. to 32768).
-        if self.num_entries > 0 {
-            self.init_spdk_tracing();
-        }
+        // To enable SPDK tracing set self.traces.entries (eg. to 32768).
+        self.init_spdk_tracing();
 
         Reactor::block_on(async {
             let (sender, receiver) = oneshot::channel::<bool>();
@@ -1151,6 +1257,13 @@ impl MayastorEnvironment {
             }
 
             let master = Reactors::current();
+            // Put the master core into interrupt mode too if the
+            // feature was enabled. The slave reactors transition via
+            // poll_reactor(); master is driven by tokio through the
+            // Future impl below, so we have to call it explicitly.
+            // No-op if interrupt mode isn't enabled on master.
+            // Threads added later are handled via add_incoming.
+            master.enter_interrupt_mode();
             master.send_future(async { f() });
             let mut futures: Vec<Pin<Box<dyn future::Future<Output = FutureResult>>>> = Vec::new();
             if let Some(grpc_endpoint) = grpc_endpoint {

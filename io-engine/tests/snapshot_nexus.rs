@@ -195,6 +195,9 @@ async fn create_device(url: &str) -> String {
 }
 
 fn check_replica_snapshot(params: &SnapshotParams, snapshot: &SnapshotInfo) {
+    println!("{params:#?}");
+    println!("{snapshot:#?}");
+
     assert_eq!(
         snapshot.snapshot_uuid,
         params.snapshot_uuid().unwrap(),
@@ -274,7 +277,7 @@ async fn test_replica_handle_snapshot() {
         Some(Utc::now().to_string()),
         false,
     );
-    let mut snapshot_params_clone = snapshot_params.clone();
+    let snapshot_params_clone = snapshot_params.clone();
 
     ms.spawn(async move {
         let device_name = create_device(&urls[0]).await;
@@ -285,6 +288,9 @@ async fn test_replica_handle_snapshot() {
             .create_snapshot(snapshot_params)
             .await
             .expect("Failed to create snapshot");
+
+        // clean up to avoid weirdness since this is still used by another nexus
+        device_destroy(&urls[0]).await.unwrap();
     })
     .await;
 
@@ -300,7 +306,6 @@ async fn test_replica_handle_snapshot() {
         .expect("Failed to list snapshots on replica node")
         .into_inner()
         .snapshots;
-    snapshot_params_clone.set_parent_id(String::default());
     check_replica_snapshot(
         &snapshot_params_clone,
         snapshots

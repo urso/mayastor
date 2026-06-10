@@ -1,377 +1,260 @@
 use crate::{
     context::{Context, OutputFormat},
-    parse_size, ClientError, GrpcStatus,
+    GrpcStatus,
 };
 use byte_unit::Byte;
-use clap::{Arg, ArgMatches, Command};
+use clap::{Args, Subcommand};
 use colored_json::ToColoredJson;
-use io_engine_api::v1 as v1rpc;
+use io_engine_api::{v1 as v1rpc, v1::pool::Pool};
 use snafu::ResultExt;
-use std::{convert::TryFrom, str::FromStr};
-use strum::VariantNames;
-use strum_macros::{AsRefStr, EnumString, VariantNames};
+use std::convert::TryFrom;
 use tonic::Status;
+use uuid::Uuid;
 
-pub fn subcommands() -> Command {
-    let create = Command::new("create")
-        .about("Create new or import existing storage pool")
-        .arg(
-            Arg::new("pool")
-                .required(true)
-                .index(1)
-                .help("Storage pool name"),
-        )
-        .arg(
-            Arg::new("uuid")
-                .long("uuid")
-                .required(false)
-                .help("Storage pool uuid"),
-        )
-        .arg(
-            Arg::new("cluster-size")
-                .long("cluster-size")
-                .required(false)
-                .help("SPDK cluster size"),
-        )
-        .arg(
-            Arg::new("max-expansion")
-                .long("max-expansion")
-                .required(false)
-                .help("Max expected expansion in factor or absolute size"),
-        )
-        .arg(
-            Arg::new("disk")
-                .required(true)
-                .action(clap::ArgAction::Append)
-                .index(2)
-                .help("Disk device files"),
-        )
-        .arg(
-            Arg::new("type")
-                .short('t')
-                .long("type")
-                .help("The type of the pool")
-                .required(false)
-                .value_parser(PoolType::types().to_vec())
-                .default_value(PoolType::Lvs.as_ref()),
-        )
-        .arg(
-            Arg::new("cipher")
-                .short('c')
-                .long("cipher")
-                .help("The cipher to use for encryption")
-                .required(false)
-                .requires("encryption-key"),
-        )
-        .arg(
-            Arg::new("encryption-key")
-                .short('k')
-                .long("encryption-key")
-                .help("The encryption key of the pool in hexlified format")
-                .required(false),
-        )
-        .arg(
-            Arg::new("xts-key")
-                .short('e')
-                .long("xts-key")
-                .help("encryption key2 required for AES_XTS")
-                .required(false)
-                .required_if_eq("cipher", "AES_XTS"),
-        )
-        .arg(
-            Arg::new("raid")
-                .long("raid")
-                .help("RAID level for LVS pools")
-                .required(false)
-                .value_parser(["raid0"]),
-        )
-        .arg(
-            Arg::new("raid-strip-size")
-                .long("raid-strip-size")
-                .help("RAID strip size in KB (default: 64)")
-                .required(false)
-                .requires("raid"),
-        );
-
-    let import = Command::new("import")
-        .about("Import existing storage pool, fail if pool does not exist")
-        .arg(
-            Arg::new("pool")
-                .required(true)
-                .index(1)
-                .help("Storage pool name"),
-        )
-        .arg(
-            Arg::new("uuid")
-                .short('u')
-                .long("uuid")
-                .required(false)
-                .help("Storage pool uuid"),
-        )
-        .arg(
-            Arg::new("disk")
-                .required(true)
-                .action(clap::ArgAction::Append)
-                .index(2)
-                .help("Disk device files"),
-        )
-        .arg(
-            Arg::new("type")
-                .short('t')
-                .long("type")
-                .help("The type of the pool")
-                .required(false)
-                .value_parser(PoolType::types().to_vec())
-                .default_value(PoolType::Lvs.as_ref()),
-        )
-        .arg(
-            Arg::new("cipher")
-                .short('c')
-                .long("cipher")
-                .help("The cipher to use for encryption")
-                .required(false)
-                .requires("encryption-key"),
-        )
-        .arg(
-            Arg::new("encryption-key")
-                .short('k')
-                .long("encryption-key")
-                .help("The encryption key of the pool in hexlified format")
-                .required(false),
-        )
-        .arg(
-            Arg::new("xts-key")
-                .short('e')
-                .long("xts-key")
-                .help("encryption key2 required for AES_XTS")
-                .required_if_eq("cipher", "AES_XTS")
-                .required(false),
-        )
-        .arg(
-            Arg::new("raid")
-                .long("raid")
-                .help("RAID level for LVS pools")
-                .required(false)
-                .value_parser(["raid0"]),
-        )
-        .arg(
-            Arg::new("raid-strip-size")
-                .long("raid-strip-size")
-                .help("RAID strip size in KB (default: 64)")
-                .required(false)
-                .requires("raid"),
-        );
-
-    let destroy = Command::new("destroy")
-        .about("Destroy storage pool")
-        .arg(
-            Arg::new("pool")
-                .required(true)
-                .index(1)
-                .help("Storage pool name"),
-        )
-        .arg(
-            Arg::new("uuid")
-                .short('u')
-                .long("uuid")
-                .required(false)
-                .help("Storage pool uuid"),
-        )
-        .arg(
-            Arg::new("type")
-                .short('t')
-                .long("type")
-                .help("The type of the pool")
-                .required(false)
-                .value_parser(PoolType::types().to_vec())
-                .default_value(PoolType::Lvs.as_ref()),
-        );
-
-    let export = Command::new("export")
-        .about("Export storage pool without destroying it")
-        .arg(
-            Arg::new("name")
-                .required(true)
-                .index(1)
-                .help("Storage pool name"),
-        )
-        .arg(
-            Arg::new("uuid")
-                .short('u')
-                .long("uuid")
-                .required(false)
-                .help("Storage pool uuid"),
-        )
-        .arg(
-            Arg::new("type")
-                .short('t')
-                .long("type")
-                .help("The type of the pool")
-                .required(false)
-                .value_parser(PoolType::types().to_vec())
-                .default_value(PoolType::Lvs.as_ref()),
-        );
-
-    let expand = Command::new("expand")
-        .about("Expand a storage pool to span the entire underlying device")
-        .arg(
-            Arg::new("name")
-                .required(true)
-                .index(1)
-                .help("Storage pool name"),
-        )
-        .arg(
-            Arg::new("uuid")
-                .short('u')
-                .long("uuid")
-                .required(false)
-                .help("Storage pool uuid"),
-        )
-        .arg(
-            Arg::new("type")
-                .short('t')
-                .long("type")
-                .help("The type of the pool")
-                .required(false)
-                .value_parser(PoolType::types().to_vec())
-                .default_value(PoolType::Lvs.as_ref()),
-        );
-
-    let list = Command::new("list")
-        .about("List storage pools")
-        .arg(Arg::new("name").required(false).help("Storage pool name"))
-        .arg(Arg::new("uuid").required(false).help("Storage pool uuid"))
-        .arg(
-            Arg::new("type")
-                .short('t')
-                .long("type")
-                .help("The type of the pool")
-                .required(false)
-                .value_parser(PoolType::types().to_vec()),
-        );
-
-    Command::new("pool")
-        .subcommand_required(true)
-        .arg_required_else_help(true)
-        .about("Storage pool management")
-        .subcommand(create)
-        .subcommand(import)
-        .subcommand(destroy)
-        .subcommand(export)
-        .subcommand(expand)
-        .subcommand(list)
+fn parse_byte(s: &str) -> Result<Byte, String> {
+    Byte::parse_str(s, true).map_err(|e| e.to_string())
 }
 
-pub async fn handler(ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    match matches.subcommand().unwrap() {
-        ("create", args) => create(ctx, args).await,
-        ("import", args) => import(ctx, args).await,
-        ("destroy", args) => destroy(ctx, args).await,
-        ("export", args) => export(ctx, args).await,
-        ("expand", args) => expand(ctx, args).await,
-        ("list", args) => list(ctx, args).await,
-        (cmd, _) => {
-            Err(Status::not_found(format!("command {cmd} does not exist"))).context(GrpcStatus)
-        }
+#[derive(Debug, Args)]
+#[command(subcommand_required = true, arg_required_else_help = true)]
+pub struct PoolArgs {
+    #[command(subcommand)]
+    command: PoolCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum PoolCommands {
+    /// Create new or import existing storage pool
+    Create(CreateArgs),
+    /// Import existing storage pool, fail if pool does not exist
+    Import(ImportArgs),
+    /// Destroy storage pool
+    Destroy(DestroyArgs),
+    /// Export storage pool without destroying it
+    Export(ExportArgs),
+    /// Expand a storage pool to span the entire underlying device
+    Expand(ExpandArgs),
+    /// List storage pools
+    List(ListArgs),
+    /// Clears errors from the storage pool
+    #[command(name = "clear-errors")]
+    ClearErrors(ClearErrorsArgs),
+    /// Probes storage pool
+    Probe(ProbeArgs),
+}
+
+#[derive(Debug, Args)]
+struct CreateArgs {
+    /// Storage pool name
+    pool: String,
+    /// Disk device files
+    #[arg(action = clap::ArgAction::Append)]
+    disk: Vec<String>,
+    #[arg(long)]
+    uuid: Option<Uuid>,
+    #[arg(long = "cluster-size", value_parser = parse_byte)]
+    cluster_size: Option<Byte>,
+    #[arg(long = "max-expansion")]
+    max_expansion: Option<String>,
+    #[arg(short = 't', long = "type", default_value = "lvs")]
+    pool_type: PoolType,
+    #[arg(short = 'c', long, requires = "encryption_key")]
+    cipher: Option<Cipher>,
+    #[arg(short = 'k', long = "encryption-key")]
+    encryption_key: Option<String>,
+    #[arg(short = 'e', long = "xts-key")]
+    xts_key: Option<String>,
+    /// RAID level for LVS pools
+    #[arg(long, value_parser = ["raid0"])]
+    raid: Option<String>,
+    /// RAID strip size in KB (default: 64)
+    #[arg(long = "raid-strip-size", requires = "raid")]
+    raid_strip_size: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    /// Storage pool name
+    pool: String,
+    /// Disk device files
+    #[arg(action = clap::ArgAction::Append)]
+    disk: Vec<String>,
+    #[arg(short = 'u', long)]
+    uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type", default_value = "lvs")]
+    pool_type: PoolType,
+    #[arg(short = 'c', long, requires = "encryption_key")]
+    cipher: Option<Cipher>,
+    #[arg(short = 'k', long = "encryption-key")]
+    encryption_key: Option<String>,
+    #[arg(short = 'e', long = "xts-key")]
+    xts_key: Option<String>,
+    /// RAID level for LVS pools
+    #[arg(long, value_parser = ["raid0"])]
+    raid: Option<String>,
+    /// RAID strip size in KB (default: 64)
+    #[arg(long = "raid-strip-size", requires = "raid")]
+    raid_strip_size: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+struct DestroyArgs {
+    /// Storage pool name
+    pool: String,
+    #[arg(short = 'u', long)]
+    uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type", default_value = "lvs")]
+    pool_type: PoolType,
+}
+
+#[derive(Debug, Args)]
+struct ExportArgs {
+    /// Storage pool name
+    name: String,
+    #[arg(short = 'u', long)]
+    uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type", default_value = "lvs")]
+    pool_type: PoolType,
+}
+
+#[derive(Debug, Args)]
+struct ExpandArgs {
+    /// Storage pool name
+    name: String,
+    #[arg(short = 'u', long)]
+    uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type", default_value = "lvs")]
+    pool_type: PoolType,
+}
+
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Storage pool name
+    name: Option<String>,
+    /// Storage pool uuid
+    uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type")]
+    pool_type: Option<PoolType>,
+}
+
+#[derive(Debug, Args)]
+struct ClearErrorsArgs {
+    /// Storage pool name
+    name: String,
+    /// Disk devices to clear errors or all if not specified
+    #[arg(action = clap::ArgAction::Append)]
+    disk: Vec<String>,
+    #[arg(short = 'u', long)]
+    uuid: Option<Uuid>,
+}
+
+#[derive(Debug, Args)]
+struct ProbeArgs {
+    /// Storage pool name
+    pool: String,
+    /// Disk device files
+    #[arg(action = clap::ArgAction::Append)]
+    disk: Vec<String>,
+    #[arg(short = 'u', long)]
+    uuid: Option<Uuid>,
+    #[arg(short = 't', long = "type", default_value = "lvs")]
+    pool_type: PoolType,
+    #[arg(short = 'c', long, requires = "encryption_key")]
+    cipher: Option<Cipher>,
+    #[arg(short = 'k', long = "encryption-key")]
+    encryption_key: Option<String>,
+    #[arg(short = 'e', long = "xts-key")]
+    xts_key: Option<String>,
+    #[arg(long)]
+    import: bool,
+}
+
+pub async fn handler(ctx: Context, args: PoolArgs) -> crate::Result<()> {
+    match args.command {
+        PoolCommands::Create(args) => create(ctx, args).await,
+        PoolCommands::Import(args) => import(ctx, args).await,
+        PoolCommands::Destroy(args) => destroy(ctx, args).await,
+        PoolCommands::Export(args) => export(ctx, args).await,
+        PoolCommands::Expand(args) => expand(ctx, args).await,
+        PoolCommands::List(args) => list(ctx, args).await,
+        PoolCommands::ClearErrors(args) => clear_errors(ctx, args).await,
+        PoolCommands::Probe(args) => probe(ctx, args).await,
     }
 }
 
-async fn create(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    let name = matches
-        .get_one::<String>("pool")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "pool".to_string(),
-        })?
-        .to_owned();
-
-    let uuid = matches.get_one::<String>("uuid");
-    let cipher = matches.get_one::<String>("cipher");
-
-    if let Some(c) = cipher {
-        if !c.eq_ignore_ascii_case("AES_XTS") && !c.eq_ignore_ascii_case("AES_CBC") {
-            return Err(Status::invalid_argument(
-                "Need valid cipher(AES_XTS or AES_CBC)",
-            ))
-            .context(GrpcStatus);
-        }
-    }
-
-    let enc_key = matches.get_one::<String>("encryption-key");
-    let xts_key = matches.get_one::<String>("xts-key");
-
-    let disks_list = matches
-        .get_many::<String>("disk")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "disk".to_string(),
-        })?
-        .map(|dev| dev.to_owned())
-        .collect();
-
-    let pooltype = matches
-        .get_one::<String>("type")
-        .map(|s| PoolType::from_str(s.as_str()))
-        .unwrap()
-        .map_err(|e| Status::invalid_argument(e.to_string()))
-        .context(GrpcStatus)?;
-
-    let cluster_size = match matches.get_one::<String>("cluster-size") {
-        Some(s) => match parse_size(s) {
-            Ok(s) => Some(s.as_u64() as u32),
-            Err(err) => {
-                return Err(Status::invalid_argument(format!("Bad size '{err}'")))
-                    .context(GrpcStatus);
-            }
-        },
-        None => None,
-    };
-
-    let max_expansion = match matches.get_one::<String>("max-expansion") {
-        Some(s) => match s.parse::<String>() {
-            Ok(v) => Some(v),
-            Err(err) => {
-                return Err(Status::invalid_argument(format!(
-                    "Bad metadata reservation hint '{err}'"
-                )))
-                .context(GrpcStatus);
-            }
-        },
-        None => None,
-    };
-
+fn build_encryption(
+    cipher: Option<Cipher>,
+    enc_key: Option<&String>,
+    xts_key: Option<&String>,
+) -> Result<Option<v1rpc::common::create_pool_request::Encryption>, tonic::Status> {
     let enc_key_msg = enc_key.map(|k| v1rpc::common::EncryptionKey {
         key_name: "key_".to_owned() + k.as_str(),
         key: k.clone().into(),
         key_length: (k.len() * 4) as u32,
         key2: xts_key.map(|k2| k2.clone().into()),
-        key2_length: xts_key.map(|x| { x.len() * 4 } as u32),
+        key2_length: xts_key.map(|x| (x.len() * 4) as u32),
     });
-
-    let enc_msg = enc_key_msg.map(|e| {
+    Ok(enc_key_msg.map(|e| {
         v1rpc::common::create_pool_request::Encryption::Data(v1rpc::common::EncryptionData {
-            cipher: v1rpc::common::Cipher::from_str_name(cipher.unwrap())
-                .unwrap()
-                .into(),
+            cipher: cipher
+                .map(|c| v1rpc::common::Cipher::from(c) as i32)
+                .unwrap_or_default(),
             key: Some(e),
         })
-    });
+    }))
+}
 
-    let raid_config = parse_raid_config(matches, &pooltype).context(GrpcStatus)?;
+fn build_import_encryption(
+    cipher: Option<Cipher>,
+    enc_key: Option<&String>,
+    xts_key: Option<&String>,
+) -> Result<Option<v1rpc::common::import_pool_request::Encryption>, tonic::Status> {
+    let enc_key_msg = enc_key.map(|k| v1rpc::common::EncryptionKey {
+        key_name: "key_".to_owned() + k,
+        key: k.clone().into(),
+        key_length: k.len() as u32,
+        key2: xts_key.map(|k2| k2.clone().into()),
+        key2_length: xts_key.map(|x| x.len() as u32),
+    });
+    Ok(enc_key_msg.map(|e| {
+        v1rpc::common::import_pool_request::Encryption::Data(v1rpc::common::EncryptionData {
+            cipher: cipher
+                .map(|c| v1rpc::common::Cipher::from(c) as i32)
+                .unwrap_or_default(),
+            key: Some(e),
+        })
+    }))
+}
+
+async fn create(mut ctx: Context, args: CreateArgs) -> crate::Result<()> {
+    let name = args.pool;
+    let cluster_size = args.cluster_size.map(|b| b.as_u64() as u32);
+    let max_expansion = args.max_expansion;
+    let enc_msg = build_encryption(
+        args.cipher,
+        args.encryption_key.as_ref(),
+        args.xts_key.as_ref(),
+    )
+    .context(GrpcStatus)?;
 
     let response = ctx
         .v1
         .pool
         .create_pool(v1rpc::pool::CreatePoolRequest {
             name: name.clone(),
-            uuid: uuid.map(ToString::to_string),
-            disks: disks_list,
-            pooltype: v1rpc::pool::PoolType::from(pooltype) as i32,
+            uuid: args.uuid.map(|u| u.to_string()),
+            disks: args.disk,
+            pooltype: v1rpc::pool::PoolType::from(args.pool_type) as i32,
             cluster_size,
             md_args: Some(v1rpc::pool::PoolMetadataArgs {
                 md_resv_ratio: None,
                 max_expansion,
             }),
             encryption: enc_msg,
-            xata_raid_config: raid_config,
+            xata_raid_config: args.raid.as_ref().map(|level| v1rpc::pool::XataRaidConfig {
+                level: level.clone(),
+                strip_size_kb: args.raid_strip_size.unwrap_or(64),
+            }),
         })
         .await
         .context(GrpcStatus)?;
@@ -387,17 +270,18 @@ async fn create(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
             );
         }
         OutputFormat::Default => {
-            println!("{}", &name);
+            println!("{name}");
         }
     };
 
     Ok(())
 }
 
-#[derive(EnumString, VariantNames, AsRefStr)]
-#[strum(serialize_all = "UPPERCASE")]
+#[derive(Debug, Clone, clap::ValueEnum)]
 pub(super) enum Cipher {
+    #[value(name = "AES_CBC")]
     AesCbc,
+    #[value(name = "AES_XTS")]
     AesXts,
 }
 impl From<Cipher> for v1rpc::common::Cipher {
@@ -409,16 +293,10 @@ impl From<Cipher> for v1rpc::common::Cipher {
     }
 }
 
-#[derive(EnumString, VariantNames, AsRefStr)]
-#[strum(serialize_all = "camelCase")]
+#[derive(Debug, Clone, clap::ValueEnum)]
 pub(super) enum PoolType {
     Lvs,
     Lvm,
-}
-impl PoolType {
-    pub(crate) fn types() -> &'static [&'static str] {
-        Self::VARIANTS
-    }
 }
 impl From<PoolType> for v1rpc::pool::PoolType {
     fn from(value: PoolType) -> Self {
@@ -429,71 +307,28 @@ impl From<PoolType> for v1rpc::pool::PoolType {
     }
 }
 
-async fn import(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    let name = matches
-        .get_one::<String>("pool")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "pool".to_string(),
-        })?
-        .to_owned();
-    let uuid = matches.get_one::<String>("uuid");
-    let cipher = matches.get_one::<String>("cipher");
-
-    if let Some(c) = cipher {
-        if !c.eq_ignore_ascii_case("AES_XTS") && !c.eq_ignore_ascii_case("AES_CBC") {
-            return Err(Status::invalid_argument(
-                "Need valid cipher(AES_XTS or AES_CBC)",
-            ))
-            .context(GrpcStatus);
-        }
-    }
-
-    let enc_key = matches.get_one::<String>("encryption-key");
-    let xts_key = matches.get_one::<String>("xts-key");
-
-    let disks_list = matches
-        .get_many::<String>("disk")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "disk".to_string(),
-        })?
-        .map(|dev| dev.to_owned())
-        .collect();
-    let pooltype = matches
-        .get_one::<String>("type")
-        .map(|s| PoolType::from_str(s.as_str()))
-        .unwrap()
-        .map_err(|e| Status::invalid_argument(e.to_string()))
-        .context(GrpcStatus)?;
-
-    let enc_key_msg = enc_key.map(|k| v1rpc::common::EncryptionKey {
-        key_name: "key_".to_owned() + k,
-        key: k.clone().into(),
-        key_length: k.len() as u32,
-        key2: xts_key.map(|k2| k2.clone().into()),
-        key2_length: xts_key.map(|x| x.len() as u32),
-    });
-
-    let enc_msg = enc_key_msg.map(|e| {
-        v1rpc::common::import_pool_request::Encryption::Data(v1rpc::common::EncryptionData {
-            cipher: v1rpc::common::Cipher::from_str_name(cipher.unwrap())
-                .unwrap()
-                .into(),
-            key: Some(e),
-        })
-    });
-
-    let raid_config = parse_raid_config(matches, &pooltype).context(GrpcStatus)?;
+async fn import(mut ctx: Context, args: ImportArgs) -> crate::Result<()> {
+    let name = args.pool;
+    let enc_msg = build_import_encryption(
+        args.cipher,
+        args.encryption_key.as_ref(),
+        args.xts_key.as_ref(),
+    )
+    .context(GrpcStatus)?;
 
     let response = ctx
         .v1
         .pool
         .import_pool(v1rpc::pool::ImportPoolRequest {
             name: name.clone(),
-            uuid: uuid.map(ToString::to_string),
-            disks: disks_list,
-            pooltype: v1rpc::pool::PoolType::from(pooltype) as i32,
+            uuid: args.uuid.map(|u| u.to_string()),
+            disks: args.disk,
+            pooltype: v1rpc::pool::PoolType::from(args.pool_type) as i32,
             encryption: enc_msg,
-            xata_raid_config: raid_config,
+            xata_raid_config: args.raid.as_ref().map(|level| v1rpc::pool::XataRaidConfig {
+                level: level.clone(),
+                strip_size_kb: args.raid_strip_size.unwrap_or(64),
+            }),
         })
         .await
         .context(GrpcStatus)?;
@@ -509,21 +344,16 @@ async fn import(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
             );
         }
         OutputFormat::Default => {
-            println!("{}", &name);
+            println!("{name}");
         }
     };
 
     Ok(())
 }
 
-async fn destroy(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    let name = matches
-        .get_one::<String>("pool")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "pool".to_string(),
-        })?
-        .to_owned();
-    let uuid = matches.get_one::<String>("uuid").cloned();
+async fn destroy(mut ctx: Context, args: DestroyArgs) -> crate::Result<()> {
+    let name = args.pool;
+    let uuid = args.uuid.map(|u| u.to_string());
 
     let _ = ctx
         .v1
@@ -545,14 +375,9 @@ async fn destroy(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
     Ok(())
 }
 
-async fn export(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    let name = matches
-        .get_one::<String>("name")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "name".to_string(),
-        })?
-        .to_owned();
-    let uuid = matches.get_one::<String>("uuid").cloned();
+async fn export(mut ctx: Context, args: ExportArgs) -> crate::Result<()> {
+    let name = args.name;
+    let uuid = args.uuid.map(|u| u.to_string());
 
     let _ = ctx
         .v1
@@ -574,21 +399,10 @@ async fn export(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
     Ok(())
 }
 
-async fn expand(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    let name = matches
-        .get_one::<String>("name")
-        .ok_or_else(|| ClientError::MissingValue {
-            field: "name".to_string(),
-        })?
-        .to_owned();
-    let uuid = matches.get_one::<String>("uuid").cloned();
-
-    let pooltype = matches
-        .get_one::<String>("type")
-        .map(|s| PoolType::from_str(s.as_str()))
-        .transpose()
-        .map_err(|e| Status::invalid_argument(e.to_string()))
-        .context(GrpcStatus)?;
+async fn expand(mut ctx: Context, args: ExpandArgs) -> crate::Result<()> {
+    let name = args.name;
+    let uuid = args.uuid.map(|u| u.to_string());
+    let pooltype = Some(args.pool_type);
 
     let list_response = ctx
         .v1
@@ -604,7 +418,7 @@ async fn expand(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
         .context(GrpcStatus)?;
 
     if list_response.get_ref().pools.is_empty() {
-        return Err(ClientError::GrpcStatus {
+        return Err(crate::ClientError::GrpcStatus {
             source: Status::not_found(format!("Pool {name} not found")),
             backtrace: None,
         });
@@ -636,46 +450,22 @@ async fn expand(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
     Ok(())
 }
 
-async fn list(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
-    ctx.v2("Requesting a list of pools");
-
-    let name = matches.get_one::<String>("name").cloned();
-    let uuid = matches.get_one::<String>("uuid").cloned();
-    let pooltype = matches
-        .get_one::<String>("type")
-        .map(|s| PoolType::from_str(s.as_str()))
-        .transpose()
-        .map_err(|e| Status::invalid_argument(e.to_string()))
-        .context(GrpcStatus)?;
-
-    let response = ctx
-        .v1
-        .pool
-        .list_pools(v1rpc::pool::ListPoolOptions {
-            name,
-            uuid,
-            pooltype: pooltype.map(|pooltype| v1rpc::pool::PoolTypeValue {
-                value: v1rpc::pool::PoolType::from(pooltype) as i32,
-            }),
-        })
-        .await
-        .context(GrpcStatus)?;
-
+fn list_pools(ctx: Context, pools: either::Either<Pool, Vec<Pool>>) -> crate::Result<()> {
     match ctx.output {
         OutputFormat::Json => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(response.get_ref())
-                    .unwrap()
-                    .to_colored_json_auto()
-                    .unwrap()
-            );
+            let json = match pools {
+                either::Either::Left(pool) => serde_json::to_string_pretty(&pool).unwrap(),
+                either::Either::Right(pools) => serde_json::to_string_pretty(&pools).unwrap(),
+            };
+            let json = json.to_colored_json_auto().unwrap();
+            println!("{json}");
         }
         OutputFormat::Default => {
-            let pools: &Vec<v1rpc::pool::Pool> = &response.get_ref().pools;
-            if pools.is_empty() {
-                ctx.v1("No pools found");
-                return Ok(());
+            if let either::Either::Right(ref pools) = pools {
+                if pools.is_empty() {
+                    ctx.v1("No pools found");
+                    return Ok(());
+                }
             }
 
             fn percentage_str(a: u64, b: u64) -> String {
@@ -686,133 +476,188 @@ async fn list(mut ctx: Context, matches: &ArgMatches) -> crate::Result<()> {
                     "-".to_string()
                 }
             }
+            fn map_pool(ctx: &Context, p: Pool) -> Vec<String> {
+                let cap = Byte::from_u64(p.capacity);
+                let used = Byte::from_u64(p.used);
+                let state = pool_state_to_str(p.state);
+                let errors = p.errors.unwrap_or_default();
+                let alerts = errors.alerts.unwrap_or_default();
+                let status = pool_status_to_str(alerts.status);
+                let cluster = Byte::from_u64(p.cluster_size.into());
+                let page_size = p
+                    .page_size
+                    .map(|s| ctx.units_with(Byte::from_u64(s.into()), byte_unit::UnitType::Binary))
+                    .unwrap_or("-".to_string());
+                let disk_cap = Byte::from_u64(p.disk_capacity);
 
-            let table = pools
-                .iter()
-                .map(|p| {
-                    let cap = Byte::from_u64(p.capacity);
-                    let used = Byte::from_u64(p.used);
-                    let state = pool_state_to_str(p.state);
-                    let cluster = Byte::from_u64(p.cluster_size.into());
-                    let page_size = p
-                        .page_size
-                        .map(|s| ctx.units(Byte::from_u64(s.into())))
-                        .unwrap_or("-".to_string());
-                    let disk_cap = Byte::from_u64(p.disk_capacity);
+                let (md_page_size, md_pages, md_used_pages, md_usage) =
+                    if let Some(t) = p.md_info.as_ref() {
+                        (
+                            ctx.units_with(t.md_page_size.into(), byte_unit::UnitType::Binary),
+                            t.md_pages.to_string(),
+                            t.md_used_pages.to_string(),
+                            percentage_str(t.md_used_pages, t.md_pages),
+                        )
+                    } else {
+                        (
+                            "-".to_string(),
+                            "-".to_string(),
+                            "-".to_string(),
+                            "-".to_string(),
+                        )
+                    };
 
-                    let (md_page_size, md_pages, md_used_pages, md_usage) =
-                        if let Some(t) = p.md_info.as_ref() {
-                            (
-                                ctx.units(t.md_page_size.into()),
-                                t.md_pages.to_string(),
-                                t.md_used_pages.to_string(),
-                                percentage_str(t.md_used_pages, t.md_pages),
-                            )
-                        } else {
-                            (
-                                "-".to_string(),
-                                "-".to_string(),
-                                "-".to_string(),
-                                "-".to_string(),
-                            )
-                        };
-
-                    let raid_level = p
-                        .xata_raid_info
-                        .as_ref()
-                        .map(|r| format!("{} ({})", r.level, r.state))
-                        .unwrap_or_else(|| "none".to_string());
-
-                    vec![
-                        p.name.clone(),
-                        p.uuid.clone(),
-                        state.to_string(),
-                        ctx.units(cap),
-                        ctx.units(used),
-                        percentage_str(p.used, p.capacity),
-                        ctx.units(cluster),
-                        page_size,
-                        md_page_size,
-                        md_pages,
-                        md_used_pages,
-                        md_usage,
-                        p.disks.join(" "),
-                        ctx.units(disk_cap),
-                        p.encrypted.unwrap_or_default().to_string(),
-                        raid_level,
-                    ]
-                })
-                .collect();
-            ctx.print_list(
                 vec![
-                    "NAME",
-                    "UUID",
-                    "STATE",
-                    "CAPACITY",
-                    "USED",
-                    "USED%",
-                    "CLUSTER_SIZE",
-                    "PAGE_SIZE",
-                    "MD_PAGE_SIZE",
-                    "MD_PAGES",
-                    "MD_USED_PAGES",
-                    "MD_USED%",
-                    "DISKS",
-                    "DISK_CAPACITY",
-                    "ENCRYPTED",
-                    "RAID",
-                ],
-                table,
+                    p.name.clone(),
+                    p.uuid.clone(),
+                    state.to_string(),
+                    status.to_string(),
+                    ctx.units(cap),
+                    ctx.units(used),
+                    percentage_str(p.used, p.capacity),
+                    ctx.units_with(cluster, byte_unit::UnitType::Binary),
+                    page_size,
+                    md_page_size,
+                    md_pages,
+                    md_used_pages,
+                    md_usage,
+                    p.disks.join(" "),
+                    ctx.units(disk_cap),
+                    p.encrypted.unwrap_or_default().to_string(),
+                    errors.io_error_count.to_string(),
+                ]
+            }
+            let headers = vec![
+                "NAME",
+                "UUID",
+                "STATE",
+                "STATUS",
+                "CAPACITY",
+                "USED",
+                "USED%",
+                "CLUSTER_SIZE",
+                "PAGE_SIZE",
+                "MD_PAGE_SIZE",
+                "MD_PAGES",
+                "MD_USED_PAGES",
+                "MD_USED%",
+                "DISKS",
+                "DISK_CAPACITY",
+                "ENCRYPTED",
+                "ERRORS",
+            ];
+            let pools = match pools {
+                either::Either::Left(pool) => {
+                    vec![pool]
+                }
+                either::Either::Right(pools) => pools,
+            };
+            let table = pools.into_iter().map(|p| map_pool(&ctx, p)).collect();
+            ctx.print_list(headers, table);
+        }
+    }
+
+    Ok(())
+}
+
+async fn list(mut ctx: Context, args: ListArgs) -> crate::Result<()> {
+    ctx.v2("Requesting a list of pools");
+
+    let response = ctx
+        .v1
+        .pool
+        .list_pools(v1rpc::pool::ListPoolOptions {
+            name: args.name,
+            uuid: args.uuid.map(|u| u.to_string()),
+            pooltype: args.pool_type.map(|pooltype| v1rpc::pool::PoolTypeValue {
+                value: v1rpc::pool::PoolType::from(pooltype) as i32,
+            }),
+        })
+        .await
+        .context(GrpcStatus)?;
+
+    list_pools(ctx, either::Right(response.into_inner().pools))
+}
+
+async fn clear_errors(mut ctx: Context, args: ClearErrorsArgs) -> crate::Result<()> {
+    let name = args.name;
+    let uuid = args.uuid.map(|u| u.to_string());
+    let disks = args.disk;
+
+    let response = ctx
+        .v1
+        .pool
+        .clear_errors(v1rpc::pool::ClearErrorRequest {
+            name: name.clone(),
+            uuid,
+            disks,
+            clear: 0,
+        })
+        .await
+        .context(GrpcStatus)?;
+
+    list_pools(ctx, either::Left(response.into_inner()))
+}
+
+async fn probe(mut ctx: Context, args: ProbeArgs) -> crate::Result<()> {
+    let name = args.pool;
+    let enc_msg = build_import_encryption(
+        args.cipher,
+        args.encryption_key.as_ref(),
+        args.xts_key.as_ref(),
+    )
+    .context(GrpcStatus)?;
+
+    let response = ctx
+        .v1
+        .pool
+        .probe_pool(v1rpc::pool::ProbePoolRequest {
+            request: Some(v1rpc::pool::ImportPoolRequest {
+                name: name.clone(),
+                uuid: args.uuid.map(|u| u.to_string()),
+                disks: args.disk,
+                pooltype: v1rpc::pool::PoolType::from(args.pool_type) as i32,
+                encryption: enc_msg,
+            }),
+            import: args.import,
+            probes: None,
+        })
+        .await
+        .context(GrpcStatus)?
+        .into_inner();
+
+    match ctx.output {
+        OutputFormat::Json => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&response)
+                    .unwrap()
+                    .to_colored_json_auto()
+                    .unwrap()
             );
+        }
+        OutputFormat::Default => {
+            println!("{response:#?}");
         }
     };
 
     Ok(())
 }
 
-/// Parse pool configuration from command line arguments
-fn parse_raid_config(
-    matches: &ArgMatches,
-    pooltype: &PoolType,
-) -> Result<Option<v1rpc::pool::XataRaidConfig>, Status> {
-    let raid_level = matches.get_one::<String>("raid");
-    if raid_level.is_none() {
-        return Ok(None);
-    }
-
-    if !matches!(pooltype, PoolType::Lvs) {
-        return Err(Status::invalid_argument(
-            "RAID configuration is only supported for LVS pools",
-        ));
-    }
-
-    let strip_size_kb = matches
-        .get_one::<String>("raid-strip-size")
-        .map(|s| {
-            s.parse::<u32>()
-                .map_err(|err| Status::invalid_argument(format!("Invalid strip size: {err}")))
-        })
-        .transpose()?
-        .unwrap_or(64);
-
-    match raid_level.map(|s| s.as_str()) {
-        Some("raid0") => Ok(Some(v1rpc::pool::XataRaidConfig {
-            config: Some(v1rpc::pool::xata_raid_config::Config::Raid0(
-                v1rpc::pool::Raid0Config { strip_size_kb },
-            )),
-        })),
-        Some(level) => Err(Status::invalid_argument(format!(
-            "Unsupported RAID level: {level}"
-        ))),
-        None => Ok(None),
-    }
-}
-
 fn pool_state_to_str(idx: i32) -> &'static str {
-    match v1rpc::pool::PoolState::try_from(idx).unwrap() {
+    match v1rpc::pool::PoolState::try_from(idx).unwrap_or_default() {
         v1rpc::pool::PoolState::PoolUnknown => "unknown",
         v1rpc::pool::PoolState::PoolOnline => "online",
+        v1rpc::pool::PoolState::PoolSuspected => "suspected",
         v1rpc::pool::PoolState::PoolDegraded => "degraded",
         v1rpc::pool::PoolState::PoolFaulted => "faulted",
+    }
+}
+fn pool_status_to_str(idx: i32) -> &'static str {
+    match v1rpc::pool::PoolAlertStatus::try_from(idx).unwrap_or_default() {
+        v1rpc::pool::PoolAlertStatus::Healthy => "healthy",
+        v1rpc::pool::PoolAlertStatus::Attention => "attention",
+        v1rpc::pool::PoolAlertStatus::Warning => "warning",
+        v1rpc::pool::PoolAlertStatus::Critical => "critical",
     }
 }

@@ -698,9 +698,7 @@ impl DeviceEventListener for Nexus<'_> {
             }
             DeviceEventType::AdminCommandCompletionFailed => {
                 info!(
-                    "{:?}: admin command completion failure event: \
-                    retiring child '{}'",
-                    self, dev_name
+                    "{self:?}: admin command completion failure event: retiring child '{dev_name}'"
                 );
                 self.retire_child_device(dev_name, FaultReason::AdminCommandFailed, false);
             }
@@ -708,14 +706,19 @@ impl DeviceEventListener for Nexus<'_> {
                 Reactors::master().send_future(Nexus::disconnect_failed_child(
                     self.name.clone(),
                     dev_name.to_owned(),
+                    true,
+                ));
+            }
+            DeviceEventType::AdminQBroken => {
+                Reactors::master().send_future(Nexus::disconnect_failed_child(
+                    self.name.clone(),
+                    dev_name.to_owned(),
+                    false,
                 ));
             }
 
             _ => {
-                warn!(
-                    "{:?}: ignoring event '{:?}' for device '{}'",
-                    self, evt, dev_name
-                );
+                warn!("{self:?}: ignoring event '{evt:?}' for device '{dev_name}'");
             }
         }
     }
@@ -820,11 +823,19 @@ impl<'n> Nexus<'n> {
         if let Some(mut nexus) = nexus_lookup_mut(&nexus_name) {
             match nexus.as_mut().lookup_child_by_device_mut(&child_device) {
                 Some(child) => {
-                    info!(nexus_name, child_device, "Unplugging nexus child device",);
-                    child.unplug().await;
+                    if child.hot_removed() {
+                        error!(
+                            nexus_name,
+                            child_device, "Retiring nexus child device on hot-remove"
+                        );
+                        nexus.retire_child_device(&child_device, FaultReason::HotRemove, false);
+                    } else {
+                        info!(nexus_name, child_device, "Unplugging nexus child device");
+                        child.unplug().await;
+                    }
                 }
                 None => {
-                    warn!(nexus_name, child_device, "Nexus child device not found",);
+                    warn!(nexus_name, child_device, "Nexus child device not found");
                 }
             }
         } else {
@@ -836,25 +847,34 @@ impl<'n> Nexus<'n> {
     }
 
     /// Disconnect a failed child from the given nexus.
-    async fn disconnect_failed_child(nexus_name: String, dev: String) {
-        let Some(nex) = nexus_lookup_mut(&nexus_name) else {
-            warn!(
-                "Nexus '{nexus_name}': retiring failed device '{dev}': \
-                nexus already gone"
-            );
+    async fn disconnect_failed_child(nexus_name: String, dev: String, ctrl_failed: bool) {
+        let Some(nexus) = nexus_lookup_mut(&nexus_name) else {
+            warn!("Nexus '{nexus_name}': retiring failed device '{dev}': nexus already gone");
             return;
         };
 
-        info!("Nexus '{nexus_name}': disconnect handlers for controller failed device: '{dev}'");
+        info!("Nexus '{nexus_name}': disconnect handlers for controller failed device: '{dev}', failed: {ctrl_failed}");
 
-        if nex.io_subsystem_state() == Some(NexusPauseState::Pausing) {
-            nex.traverse_io_channels_async((), |channel, _| {
+        let Ok(child) = nexus.child_by_device(&dev) else {
+            warn!("Nexus '{nexus_name}': retiring failed device '{dev}': child already gone");
+            return;
+        };
+        if !child.is_faulted() {
+            error!("Nexus '{nexus_name}': retiring failed device '{dev}': child not faulted");
+            return;
+        }
+
+        if nexus.io_subsystem_state() != Some(NexusPauseState::Pausing) {
+            error!("Nexus '{nexus_name}': retiring failed device '{dev}': nexus not pausing");
+            return;
+        }
+        nexus
+            .traverse_io_channels_async((), |channel, _| {
                 channel.disconnect_detached_devices(|h| {
-                    h.get_device().device_name() == dev && h.is_ctrlr_failed()
+                    h.get_device().device_name() == dev && (h.is_ctrlr_failed() || !ctrl_failed)
                 });
             })
             .await;
-        }
     }
 
     /// Retires a child device for the given nexus.
@@ -983,7 +1003,7 @@ impl<'n> Nexus<'n> {
                 match num_healthy {
                     0 => {
                         warn!(
-                            "{self:?}: no healthy replicas persent \
+                            "{self:?}: no healthy replicas present \
                             in persistent store when retiring replica '{uri}':
                             not persisting the replica state",
                         );
@@ -1143,7 +1163,7 @@ impl<'n> Nexus<'n> {
 
                 // Step 5: Mark nexus as shutdown.
                 // Note: we don't persist nexus's state in ETCd as nexus
-                // might be recreated on onother node.
+                // might be recreated on another node.
                 *nexus.state.lock() = NexusState::Shutdown;
             }
         });

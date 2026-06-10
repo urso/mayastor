@@ -140,6 +140,8 @@ impl StatsRpc for StatsService {
                 let pools_stats = join_all(pools_stats_future).await.into_iter();
                 let stats = pools_stats
                     .map(|d| d.map(Into::into))
+                    // todo: it will error out if any error is encountered
+                    // this may not be ideal since we'd miss out of other stats!
                     .collect::<Result<Vec<_>, _>>()?;
 
                 Ok(PoolIoStatsResponse { stats })
@@ -254,6 +256,8 @@ impl From<ReplicaBdevStats> for ReplicaIoStats {
         Self {
             entity_id: value.entity_id,
             stats: Some(value.stats.into()),
+            poolname: value.poolname,
+            pooluuid: value.pooluuid,
         }
     }
 }

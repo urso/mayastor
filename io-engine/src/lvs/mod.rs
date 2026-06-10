@@ -19,7 +19,7 @@ pub use lvs_error::{BsError, ImportErrorReason, LvsError};
 pub use lvs_iter::{LvsBdevIter, LvsIter};
 pub use lvs_lvol::{Lvol, LvsLvol, PropName, PropValue};
 pub use lvs_store::Lvs;
-use std::{convert::TryFrom, pin::Pin};
+use std::pin::Pin;
 
 mod lvol_iter;
 mod lvol_snapshot;
@@ -30,7 +30,7 @@ pub mod lvs_lvol;
 mod lvs_store;
 
 use crate::{
-    core::{BdevStater, BdevStats, CoreError, UntypedBdev},
+    core::{BdevErrorStats, BdevStater, BdevStats, CoreError, UntypedBdev},
     replica_backend::{FindSnapshotArgs, ReplicaBdevStats},
 };
 pub use lvol_snapshot::{LvolResult, LvolSnapshotDescriptor, LvolSnapshotOps};
@@ -60,8 +60,11 @@ impl ReplicaOps for Lvol {
             .await
             .map_err(Into::into)
     }
-    async fn unshare(&mut self) -> Result<(), crate::pool_backend::Error> {
-        Pin::new(self).unshare().await.map_err(Into::into)
+    async fn unshare(
+        &mut self,
+        opts: Option<crate::core::UnshareProps>,
+    ) -> Result<(), crate::pool_backend::Error> {
+        Pin::new(self).unshare(opts).await.map_err(Into::into)
     }
     async fn update_properties(
         &mut self,
@@ -104,7 +107,12 @@ impl BdevStater for Lvol {
 
     async fn stats(&self) -> Result<ReplicaBdevStats, CoreError> {
         let stats = self.as_bdev().stats().await?;
-        Ok(ReplicaBdevStats::new(stats, self.entity_id()))
+        Ok(ReplicaBdevStats::new(
+            stats,
+            self.entity_id(),
+            Some(self.pool_name()),
+            Some(self.pool_uuid()),
+        ))
     }
 
     async fn reset_stats(&self) -> Result<(), CoreError> {
@@ -156,6 +164,25 @@ impl PoolOps for Lvs {
         (*self).grow().await?;
         Ok(())
     }
+
+    async fn reset_errors(&self) -> Result<(), crate::pool_backend::Error> {
+        self.base_bdev()?
+            .reset_stats_ext(spdk_rs::BdevStatsResetMode::Errors)
+            .await
+            .map_err(|errno| crate::pool_backend::Error::Gen {
+                source: crate::pool_backend::GenericError::StatsReset { errno },
+            })?;
+        Ok(())
+    }
+}
+
+fn lvs_bdev(lvs: &Lvs) -> Result<UntypedBdev, CoreError> {
+    match lvs.base_bdev_opt() {
+        Some(bdev) => Ok(bdev),
+        None => Err(CoreError::OpenBdev {
+            source: nix::Error::EINPROGRESS,
+        }),
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -163,12 +190,17 @@ impl BdevStater for Lvs {
     type Stats = BdevStats;
 
     async fn stats(&self) -> Result<BdevStats, CoreError> {
-        let stats = self.base_bdev().stats_async().await?;
+        let stats = lvs_bdev(self)?.stats_async().await?;
         Ok(BdevStats::new(self.name().to_string(), self.uuid(), stats))
     }
 
+    async fn error_stats(&self) -> Result<BdevErrorStats, CoreError> {
+        let stats = lvs_bdev(self)?.stats_errors_async().await?;
+        Ok(BdevErrorStats(stats))
+    }
+
     async fn reset_stats(&self) -> Result<(), CoreError> {
-        self.base_bdev().reset_bdev_io_stats().await
+        lvs_bdev(self)?.reset_bdev_io_stats().await
     }
 }
 
@@ -186,12 +218,14 @@ impl IPoolProps for Lvs {
     }
 
     fn disks(&self) -> Vec<String> {
+        let Some(base_bdev) = self.base_bdev_opt() else {
+            return vec![];
+        };
         // Calling crypto_base_bdev() on non crypto bdev returns None.
-        let root_base_bdev = self.base_bdev();
-        let disk_bdev = root_base_bdev
+        let disk_bdev = base_bdev
             .crypto_base_bdev()
             .map(Bdev::new)
-            .unwrap_or(root_base_bdev);
+            .unwrap_or(base_bdev);
 
         if let Some(raid_bdev) = disk_bdev.as_raid_bdev() {
             return raid_bdev
@@ -204,7 +238,9 @@ impl IPoolProps for Lvs {
     }
 
     fn disk_capacity(&self) -> u64 {
-        self.base_bdev().size_in_bytes()
+        self.base_bdev_opt()
+            .map(|b| b.size_in_bytes())
+            .unwrap_or_default()
     }
 
     fn cluster_size(&self) -> u32 {
@@ -332,9 +368,7 @@ impl IReplicaFactory for ReplLvsFactory {
         &self,
         args: &FindReplicaArgs,
     ) -> Result<Option<Box<dyn ReplicaOps>>, crate::pool_backend::Error> {
-        let lvol = crate::core::Bdev::lookup_by_uuid_str(&args.uuid)
-            .map(Lvol::try_from)
-            .transpose()?;
+        let lvol = Lvol::lookup_by_uuid_str(&args.uuid);
         Ok(lvol.map(|l| Box::new(l) as _))
     }
 
@@ -342,9 +376,7 @@ impl IReplicaFactory for ReplLvsFactory {
         &self,
         args: &FindSnapshotArgs,
     ) -> Result<Option<Box<dyn SnapshotOps>>, crate::pool_backend::Error> {
-        let lvol = crate::core::Bdev::lookup_by_uuid_str(&args.uuid)
-            .map(Lvol::try_from)
-            .transpose()?;
+        let lvol = Lvol::lookup_by_uuid_str(&args.uuid);
         if let Some(lvol) = &lvol {
             // should this be an error?
             if !lvol.is_snapshot() {
@@ -373,8 +405,8 @@ impl IReplicaFactory for ReplLvsFactory {
     ) -> Result<Vec<SnapshotDescriptor>, crate::pool_backend::Error> {
         // if snapshot_uuid is input, get specific snapshot result
         Ok(if let Some(ref snapshot_uuid) = args.uuid {
-            let lvol = match crate::core::UntypedBdev::lookup_by_uuid_str(snapshot_uuid) {
-                Some(bdev) => Lvol::try_from(bdev)?,
+            let lvol = match Lvol::lookup_by_uuid_str(snapshot_uuid) {
+                Some(lvol) => lvol,
                 None => {
                     return Err(LvsError::Invalid {
                         source: BsError::LvolNotFound {},
@@ -385,8 +417,8 @@ impl IReplicaFactory for ReplLvsFactory {
             };
             lvol.list_snapshot_by_snapshot_uuid()
         } else if let Some(ref replica_uuid) = args.source_uuid {
-            let lvol = match crate::core::UntypedBdev::lookup_by_uuid_str(replica_uuid) {
-                Some(bdev) => Lvol::try_from(bdev)?,
+            let lvol = match Lvol::lookup_by_uuid_str(replica_uuid) {
+                Some(lvol) => lvol,
                 None => {
                     return Err(LvsError::Invalid {
                         source: BsError::LvolNotFound {},
@@ -406,8 +438,8 @@ impl IReplicaFactory for ReplLvsFactory {
         args: &ListCloneArgs,
     ) -> Result<Vec<Box<dyn ReplicaOps>>, crate::pool_backend::Error> {
         let clones = if let Some(snapshot_uuid) = &args.snapshot_uuid {
-            let snap_lvol = match crate::core::UntypedBdev::lookup_by_uuid_str(snapshot_uuid) {
-                Some(bdev) => Lvol::try_from(bdev),
+            let snap_lvol = match Lvol::lookup_by_uuid_str(snapshot_uuid) {
+                Some(lvol) => Ok(lvol),
                 None => Err(LvsError::Invalid {
                     source: BsError::LvolNotFound {},
                     msg: format!("Snapshot {snapshot_uuid} not found"),

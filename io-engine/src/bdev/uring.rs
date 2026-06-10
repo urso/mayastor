@@ -147,3 +147,9 @@ impl CreateDestroy for Uring {
         }
     }
 }
+
+impl super::Probe for Uring {
+    fn probe(&self, _opts: &super::ProbeOpts) -> Result<(), super::ProbeError> {
+        super::probe_file(&self.name)
+    }
+}

@@ -262,6 +262,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_format,
             args.events_url.clone(),
             args.events_replicas,
+            args.log_span_events,
         );
     } else {
         logger::init_ex(
@@ -269,15 +270,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             log_format,
             args.events_url.clone(),
             args.events_replicas,
+            args.log_span_events,
         );
     }
 
     info!("{}", fmt_package_info!());
 
-    if let Err(err) = Prctl::set_io_flusher() {
-        error!("Failed to set PR_SET_IO_FLUSHER, CAP_SYS_RESOURCE is required error: {err}");
+    if let Err(error) = Prctl::set_io_flusher() {
+        error!(%error, "Failed to set PR_SET_IO_FLUSHER (CAP_SYS_RESOURCE is required)");
     } else {
         info!("PR_SET_IO_FLUSHER is configured");
+    }
+
+    #[cfg(debug_assertions)]
+    let enable_coredump = Some(args.enable_coredump.unwrap_or(None));
+    #[cfg(not(debug_assertions))]
+    let enable_coredump = args.enable_coredump;
+    if let Some(limit) = enable_coredump {
+        let limit = limit.unwrap_or(io_engine::coredump::DEFAULT_CORE_LIMIT);
+        if let Err(error) = io_engine::coredump::enable(limit) {
+            error!(limit, ?error, "Failed to set coredump");
+        } else {
+            info!(limit, "Configured coredump");
+        }
     }
 
     // Handle diagnostics-related commands before initializing the agent.

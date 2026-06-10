@@ -9,6 +9,7 @@ use io_engine::{
 
 use io_engine_tests::MayastorTest;
 
+use io_engine::pool_backend::PoolBackend;
 use once_cell::sync::OnceCell;
 use std::{collections::HashSet, time::Instant};
 
@@ -53,12 +54,8 @@ async fn lvs_import_many_volume() {
             name: POOL_NAME.to_string(),
             disks: vec![BDEV_NAME.to_string()],
             uuid: Some(POOL_UUID.to_string()),
-            cluster_size: None,
-            md_args: None,
-            backend: Default::default(),
-            enc_key: None,
-            crypto_vbdev_name: None,
             raid_config: None,
+            no_spdk: false,
         };
 
         // Create LVS.
@@ -123,7 +120,7 @@ async fn lvs_import_many_volume() {
 
         // Check that all volumes were properly imported.
         let mut imported = HashSet::new();
-        lvs.lvols().unwrap().for_each(|v| {
+        lvs.lvols().for_each(|v| {
             imported.insert(v.name());
         });
 

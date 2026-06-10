@@ -45,6 +45,7 @@ use crate::{
     },
     ffihelper::{cb_arg, done_cb},
     sleep::mayastor_sleep,
+    subsys::nvmx::NvmxSubsystem,
 };
 
 #[derive(Debug)]
@@ -85,13 +86,16 @@ impl NvmeControllerInner<'_> {
 
         info!("Running admin queue poller on core #{}", core);
 
-        let adminq_poller = PollerBuilder::new()
-            .with_name("nvme_poll_adminq")
+        let poller = match NvmxSubsystem::adminq_thread(core) {
+            Some(thread) => PollerBuilder::new().with_thread(thread),
+            // in case the poller threads were not registered
+            None => PollerBuilder::new(),
+        };
+        let adminq_poller = poller
             .with_interval(Duration::from_micros(
                 nvme_bdev_running_config().nvme_adminq_poll_period_us,
             ))
             .with_poll_fn(move |_| nvme_poll_adminq(cfg.as_ptr().cast()))
-            .with_core(core)
             .build();
 
         Self {
@@ -788,32 +792,38 @@ pub extern "C" fn nvme_poll_adminq(ctx: *mut c_void) -> i32 {
     let result = context.process_adminq();
 
     if result < 0 {
+        let error = Errno::from_raw(result.abs());
+        let dev_name = context.name.as_str();
+
         if context.start_device_destroy() {
             error!(
-                "process adminq: {}: ctrl failed: {}, error: {}",
-                context.name,
+                "Process adminq: {dev_name}: ctrl failed: {}, error: {error}",
                 context.is_failed(),
-                Errno::from_raw(result.abs())
             );
-            info!("dispatching nexus fault and retire: {}", context.name);
-            let dev_name = context.name.as_str();
+            info!(
+                dev_name,
+                "Dispatching nexus fault and retire via AdminCommandCompletionFailed"
+            );
             let carc = NVME_CONTROLLERS.lookup_by_name(dev_name).unwrap();
-            debug!(
-                ?dev_name,
-                "notifying listeners of admin command completion failure"
-            );
             let controller = carc.lock();
             let num_listeners =
                 controller.notify_listeners(DeviceEventType::AdminCommandCompletionFailed);
             debug!(
-                ?dev_name,
-                ?num_listeners,
-                "listeners notified of admin command completion failure"
+                dev_name,
+                num_listeners, "Listeners notified of admin command completion failure"
             );
         } else if context.report_failed() {
+            error!(
+                "Reported process adminq: {dev_name}: ctrl failed: {}, error: {error}",
+                context.is_failed(),
+            );
             if let Some(carc) = NVME_CONTROLLERS.lookup_by_name(&context.name) {
                 carc.lock()
                     .notify_listeners(DeviceEventType::AdminQNoticeCtrlFailed);
+            }
+        } else if context.adminq_broken_tmo(error) {
+            if let Some(carc) = NVME_CONTROLLERS.lookup_by_name(&context.name) {
+                carc.lock().notify_listeners(DeviceEventType::AdminQBroken);
             }
         }
         return 1;
@@ -1220,8 +1230,8 @@ pub(crate) mod transport {
             self
         }
         /// svcid (port) to connect to
-        pub fn with_svcid(mut self, svcid: &str) -> Self {
-            self.svcid = svcid.to_string();
+        pub fn with_svcid<I: Into<String>>(mut self, svcid: I) -> Self {
+            self.svcid = svcid.into();
             self
         }
 

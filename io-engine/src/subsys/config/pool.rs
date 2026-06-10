@@ -206,6 +206,7 @@ impl From<&Pool> for PoolArgs {
                 None
             },
             raid_config: pool.raid_config.as_ref().map(Into::into),
+            no_spdk: false,
         }
     }
 }

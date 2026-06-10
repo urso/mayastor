@@ -284,6 +284,7 @@ impl PoolBuilderLocal {
             enc_key: None,
             crypto_vbdev_name: None,
             raid_config: None,
+            no_spdk: false,
         })
         .await?;
         Ok(lvs)

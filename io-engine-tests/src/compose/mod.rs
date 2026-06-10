@@ -42,6 +42,14 @@ impl<'a> MayastorTest<'a> {
         rx.await.unwrap()
     }
 
+    /// spawn a future on this mayastor instance without waiting for completion.
+    pub fn spawn_detached<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        self.reactor.send_future(future);
+    }
+
     pub fn send<F>(&self, future: F)
     where
         F: Future<Output = ()> + 'static,
@@ -74,6 +82,7 @@ impl<'a> MayastorTest<'a> {
     }
 
     pub fn new_ex(args: MayastorCliArgs, log_level: Option<&str>) -> MayastorTest<'static> {
+        io_engine::coredump::enable(io_engine::coredump::DEFAULT_CORE_LIMIT).ok();
         let (tx, rx) = bounded(1);
         mayastor_test_init_ex(args.log_format.unwrap_or_default(), log_level);
         let thdl = std::thread::Builder::new()
@@ -138,6 +147,9 @@ impl Drop for MayastorTest<'_> {
         self.reactor.send_future(async { mayastor_env_stop(0) });
         // wait for mayastor to stop
         let hdl = self.thdl.take().unwrap();
-        hdl.join().unwrap()
+        let result = hdl.join();
+        if !std::thread::panicking() {
+            result.unwrap();
+        }
     }
 }

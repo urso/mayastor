@@ -20,6 +20,9 @@ pub struct PoolArgs {
     pub enc_key: Option<EncryptionKey>,
     pub crypto_vbdev_name: Option<String>,
     pub raid_config: Option<RaidConfig>,
+    /// Set to false if you don't want the pool and its replicas to be managed by spdk.
+    /// Applicable for non LvsBlobstore pools, such as the LVM.
+    pub no_spdk: bool,
 }
 
 impl PoolArgs {
@@ -66,6 +69,7 @@ pub enum PoolBackend {
 }
 
 /// Arguments for replica creation.
+#[derive(Default)]
 pub struct ReplicaArgs {
     pub name: String,
     pub size: u64,
@@ -73,6 +77,27 @@ pub struct ReplicaArgs {
     pub thin: bool,
     pub entity_id: Option<String>,
     pub use_extent_table: Option<bool>,
+    pub wipe_super: bool,
+}
+impl ReplicaArgs {
+    /// Create [`ReplicaArgs`] with the given name and size.
+    pub fn new<S: Into<String>>(name: S, size: u64) -> Self {
+        Self {
+            name: name.into(),
+            size,
+            ..Default::default()
+        }
+    }
+    /// Specify the `wipe_super` argument.
+    pub fn wipe_super(mut self, wipe_super: bool) -> Self {
+        self.wipe_super = wipe_super;
+        self
+    }
+    /// Specify the `thin` argument.
+    pub fn thin(mut self, thin: bool) -> Self {
+        self.thin = thin;
+        self
+    }
 }
 
 /// Generic Errors shared by all backends.
@@ -82,18 +107,22 @@ pub struct ReplicaArgs {
 pub enum GenericError {
     #[snafu(display("{message}"))]
     NotFound { message: String },
+    #[snafu(display("Failed to reset the stats: {errno}"))]
+    StatsReset { errno: Errno },
 }
 impl From<GenericError> for tonic::Status {
     fn from(e: GenericError) -> Self {
         match e {
             GenericError::NotFound { message } => tonic::Status::not_found(message),
+            GenericError::StatsReset { .. } => tonic::Status::internal(e.to_string()),
         }
     }
 }
 impl ToErrno for GenericError {
-    fn to_errno(self) -> Errno {
+    fn to_errno(&self) -> Errno {
         match self {
             GenericError::NotFound { .. } => Errno::ENODEV,
+            GenericError::StatsReset { errno } => *errno,
         }
     }
 }
@@ -134,7 +163,7 @@ impl From<Error> for tonic::Status {
     }
 }
 impl ToErrno for Error {
-    fn to_errno(self) -> Errno {
+    fn to_errno(&self) -> Errno {
         match self {
             Error::Lvs { source } => source.to_errno(),
             Error::Lvm { source } => source.to_errno(),
@@ -161,6 +190,9 @@ pub trait PoolOps: IPoolProps + BdevStater<Stats = BdevStats> + std::fmt::Debug 
 
     /// Grows the given pool by filling the entire underlying device(s).
     async fn grow(&self) -> Result<(), Error>;
+
+    /// Reset the error stats of the pool disks.
+    async fn reset_errors(&self) -> Result<(), Error>;
 }
 
 /// Interface for a pool factory which can be used for various
