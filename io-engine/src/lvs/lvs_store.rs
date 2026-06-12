@@ -70,6 +70,8 @@ impl GetName for LvsRaidBuilder {
     }
 }
 
+impl crate::bdev::Probe for LvsRaidBuilder {}
+
 #[async_trait::async_trait(?Send)]
 impl CreateDestroy for LvsRaidBuilder {
     type Error = BdevError;
@@ -348,7 +350,7 @@ impl Lvs {
     }
 
     pub(crate) fn raid_bdev(&self) -> Option<RaidBdev> {
-        let base = self.base_bdev();
+        let base = self.base_bdev().ok()?;
         let bdev = base.crypto_base_bdev().map(Bdev::new).unwrap_or(base);
         bdev.as_raid_bdev()
     }
@@ -358,7 +360,10 @@ impl Lvs {
     /// - If RAID, returns all RAID member devices
     /// - Otherwise returns a single-item vector
     pub fn base_bdevs(&self) -> Vec<UntypedBdev> {
-        let base = self.base_bdev();
+        let base = match self.base_bdev() {
+            Ok(b) => b,
+            Err(_) => return vec![],
+        };
         let bdev = base.crypto_base_bdev().map(Bdev::new).unwrap_or(base);
 
         if let Some(raid_bdev) = bdev.as_raid_bdev() {

@@ -94,8 +94,7 @@ async fn replica_snapshot() {
                 name: POOL1_NAME.to_string(),
                 disks: vec![format!("aio://{DISKNAME1}")],
                 backend: PoolBackend::Lvs,
-            raid_config: None,
-            no_spdk: false,
+                ..Default::default()
             })
             .await
             .unwrap();

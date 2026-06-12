@@ -48,8 +48,7 @@ async fn lvs_metadata_limit() {
             name: POOL_NAME.to_string(),
             disks: vec![BDEV_NAME.to_string()],
             uuid: Some(POOL_UUID.to_string()),
-            raid_config: None,
-            no_spdk: false,
+            ..Default::default()
         };
 
         // Create LVS.

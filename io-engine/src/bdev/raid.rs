@@ -199,6 +199,8 @@ impl GetName for Raid {
     }
 }
 
+impl super::Probe for Raid {}
+
 #[async_trait(?Send)]
 impl CreateDestroy for Raid {
     type Error = BdevError;

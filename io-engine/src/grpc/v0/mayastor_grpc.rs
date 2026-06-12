@@ -282,6 +282,7 @@ impl From<LvsError> for tonic::Status {
             | LvsError::SnapshotConfigFailed { .. }
             | LvsError::CloneConfigFailed { .. }
             | LvsError::CryptoBdevNotResized { .. }
+            | LvsError::RaidBdevNotResized { .. }
             | LvsError::Property { .. }
             | LvsError::SyncProperty { .. }
             | LvsError::LvolUnShare { .. }

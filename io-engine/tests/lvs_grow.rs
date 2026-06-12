@@ -149,8 +149,8 @@ async fn lvs_grow_ms_malloc() {
                     name: POOL_NAME.to_string(),
                     disks: vec![BDEV_URI.to_string()],
                     uuid: Some(POOL_UUID.to_string()),
-            raid_config: None,
-            no_spdk: false,
+                    backend: PoolBackend::Lvs,
+                    ..Default::default()
                 };
 
                 // Create LVS.

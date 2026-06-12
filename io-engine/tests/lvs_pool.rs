@@ -1275,13 +1275,9 @@ async fn hot_detach_retach_(guard: TestHotRmGuard, share: bool, io: bool) {
                 "malloc:///raid0_malloc0?size_mb=64".to_string(),
                 "malloc:///raid0_malloc1?size_mb=64".to_string(),
             ],
-            uuid: None,
-            cluster_size: None,
-            md_args: None,
             backend: PoolBackend::Lvs,
-            enc_key: None,
-            crypto_vbdev_name: None,
             raid_config: Some(RaidConfig::Raid0(Raid0Config::default())),
+            ..Default::default()
         };
 
         // Create RAID0 pool
@@ -1348,13 +1344,9 @@ async fn hot_detach_retach_(guard: TestHotRmGuard, share: bool, io: bool) {
                 "malloc:///raid0_vol_malloc0?size_mb=64".to_string(),
                 "malloc:///raid0_vol_malloc1?size_mb=64".to_string(),
             ],
-            uuid: None,
-            cluster_size: None,
-            md_args: None,
             backend: PoolBackend::Lvs,
-            enc_key: None,
-            crypto_vbdev_name: None,
             raid_config: Some(RaidConfig::Raid0(Raid0Config::default())),
+            ..Default::default()
         };
 
         let pool = Lvs::create_or_import(pool_args).await.unwrap();
@@ -1400,13 +1392,9 @@ async fn hot_detach_retach_(guard: TestHotRmGuard, share: bool, io: bool) {
                 format!("aio://{}", RAID0_DISK1),
                 format!("aio://{}", RAID0_DISK2),
             ],
-            uuid: None,
-            cluster_size: None,
-            md_args: None,
             backend: PoolBackend::Lvs,
-            enc_key: None,
-            crypto_vbdev_name: None,
             raid_config: Some(RaidConfig::Raid0(Raid0Config { strip_size_kb })),
+            ..Default::default()
         };
 
         // Create RAID0 pool and volume
@@ -1459,13 +1447,9 @@ async fn hot_detach_retach_(guard: TestHotRmGuard, share: bool, io: bool) {
                 "malloc:///raid0_io_malloc0?size_mb=64".to_string(),
                 "malloc:///raid0_io_malloc1?size_mb=64".to_string(),
             ],
-            uuid: None,
-            cluster_size: None,
-            md_args: None,
             backend: PoolBackend::Lvs,
-            enc_key: None,
-            crypto_vbdev_name: None,
             raid_config: Some(RaidConfig::Raid0(Raid0Config::default())),
+            ..Default::default()
         };
 
         // Create RAID0 pool and volume for I/O testing
