@@ -1264,6 +1264,11 @@ async fn hot_detach_retach_(guard: TestHotRmGuard, share: bool, io: bool) {
     nexus.destroy().await.unwrap();
     lvs.destroy().await.unwrap();
 }
+
+#[tokio::test]
+async fn lvs_raid0_pool_lifecycle() {
+    let ms = ms();
+
     // RAID0 Pool Lifecycle Tests
     ms.spawn(async {
         println!("=== RAID0 Pool Creation/Destruction Test - Starting ===");

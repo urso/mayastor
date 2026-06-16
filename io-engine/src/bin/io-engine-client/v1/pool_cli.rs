@@ -227,6 +227,14 @@ fn build_import_encryption(
 }
 
 async fn create(mut ctx: Context, args: CreateArgs) -> crate::Result<()> {
+    let raid_strip_size = args.raid_strip_size.unwrap_or(64);
+    let xata_raid_config = args.raid.as_ref().map(|_level| v1rpc::pool::XataRaidConfig {
+        config: Some(v1rpc::pool::xata_raid_config::Config::Raid0(
+            v1rpc::pool::Raid0Config {
+                strip_size_kb: raid_strip_size,
+            },
+        )),
+    });
     let name = args.pool;
     let cluster_size = args.cluster_size.map(|b| b.as_u64() as u32);
     let max_expansion = args.max_expansion;
@@ -251,10 +259,7 @@ async fn create(mut ctx: Context, args: CreateArgs) -> crate::Result<()> {
                 max_expansion,
             }),
             encryption: enc_msg,
-            xata_raid_config: args.raid.as_ref().map(|level| v1rpc::pool::XataRaidConfig {
-                level: level.clone(),
-                strip_size_kb: args.raid_strip_size.unwrap_or(64),
-            }),
+            xata_raid_config,
         })
         .await
         .context(GrpcStatus)?;
@@ -308,6 +313,14 @@ impl From<PoolType> for v1rpc::pool::PoolType {
 }
 
 async fn import(mut ctx: Context, args: ImportArgs) -> crate::Result<()> {
+    let raid_strip_size = args.raid_strip_size.unwrap_or(64);
+    let xata_raid_config = args.raid.as_ref().map(|_level| v1rpc::pool::XataRaidConfig {
+        config: Some(v1rpc::pool::xata_raid_config::Config::Raid0(
+            v1rpc::pool::Raid0Config {
+                strip_size_kb: raid_strip_size,
+            },
+        )),
+    });
     let name = args.pool;
     let enc_msg = build_import_encryption(
         args.cipher,
@@ -325,10 +338,7 @@ async fn import(mut ctx: Context, args: ImportArgs) -> crate::Result<()> {
             disks: args.disk,
             pooltype: v1rpc::pool::PoolType::from(args.pool_type) as i32,
             encryption: enc_msg,
-            xata_raid_config: args.raid.as_ref().map(|level| v1rpc::pool::XataRaidConfig {
-                level: level.clone(),
-                strip_size_kb: args.raid_strip_size.unwrap_or(64),
-            }),
+            xata_raid_config,
         })
         .await
         .context(GrpcStatus)?;
@@ -615,9 +625,10 @@ async fn probe(mut ctx: Context, args: ProbeArgs) -> crate::Result<()> {
             request: Some(v1rpc::pool::ImportPoolRequest {
                 name: name.clone(),
                 uuid: args.uuid.map(|u| u.to_string()),
-                disks: args.disk,
+                disks: args.disk.clone(),
                 pooltype: v1rpc::pool::PoolType::from(args.pool_type) as i32,
                 encryption: enc_msg,
+                xata_raid_config: None,
             }),
             import: args.import,
             probes: None,
